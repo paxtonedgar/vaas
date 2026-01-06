@@ -1,0 +1,17 @@
+# Core dependencies for VaaS Tax Document Intelligence Pipeline
+# Python 3.10+
+
+# PDF Processing
+PyMuPDF>=1.23.0  # fitz - PDF extraction with layout metadata
+pdfplumber>=0.10.0  # Table extraction from forms
+
+# Data Processing
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Graph Processing
+networkx>=3.1  # Graph construction and analysis
+
+# Utilities
+python-dotenv>=1.0.0  # Environment variable management
+tqdm>=4.66.0  # Progress bars
