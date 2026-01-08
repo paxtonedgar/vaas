@@ -215,3 +215,40 @@ def classify_concept_roles_batch(
         results.append(result)
 
     return results
+
+
+def classify_section_roles(sections_df) -> "pd.DataFrame":
+    """
+    Apply concept role classification to subsection anchors in a sections DataFrame.
+
+    Adds columns:
+    - concept_role: Classified role (or None for low confidence)
+    - concept_role_confidence: Confidence score (0.0-1.0)
+    - concept_role_method: Classification method ("regex", "position", "null")
+
+    Args:
+        sections_df: Sections DataFrame with anchor_type, label, body_text columns.
+
+    Returns:
+        Sections DataFrame with concept role columns added.
+    """
+    import pandas as pd
+
+    sdf = sections_df.copy()
+    sdf["concept_role"] = None
+    sdf["concept_role_confidence"] = 0.0
+    sdf["concept_role_method"] = "null"
+
+    subsection_mask = sdf["anchor_type"] == "subsection"
+
+    for idx in sdf[subsection_mask].index:
+        header = sdf.loc[idx, "label"] or ""
+        body = sdf.loc[idx, "body_text"] or ""
+
+        result = classify_concept_role(header, body)
+
+        sdf.loc[idx, "concept_role"] = result.role
+        sdf.loc[idx, "concept_role_confidence"] = result.confidence
+        sdf.loc[idx, "concept_role_method"] = result.method
+
+    return sdf

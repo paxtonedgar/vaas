@@ -31,10 +31,27 @@ EXPECTED_BOXES_1099DIV = {
 MAX_NODE_CHARS = 4000  # Monolith warning threshold
 MAX_EVIDENCE_CHARS = 200  # Evidence snippet max length
 MIN_CONTENT_CHARS = 20  # Minimum content for a valid section
+MAX_HIERARCHY_DEPTH = 5  # doc_root → section → box → concept → paragraph
 ALLOWED_EDGE_TYPES = {
-    "references_box", "same_group", "parent_of", "includes", "same_field",
-    "excludes", "applies_if", "defines", "qualifies", "requires"
+    # Structural edges
+    "parent_of", "follows", "in_section",
+    # Reference edges
+    "references_box", "same_group", "same_field",
+    # Semantic edges
+    "includes", "excludes", "applies_if", "defines", "qualifies", "requires",
+    "portion_of",
 }
+
+# Edge buckets for distribution analysis (A8)
+STRUCTURAL_EDGE_TYPES = {"parent_of", "follows", "in_section"}
+REFERENCE_EDGE_TYPES = {"references_box", "same_group", "same_field"}
+SEMANTIC_EDGE_TYPES = ALLOWED_EDGE_TYPES - STRUCTURAL_EDGE_TYPES - REFERENCE_EDGE_TYPES
+
+# Distribution thresholds
+REF_DOMINANCE_FAIL = 0.80  # FAIL if references_box > 80% of non-structural
+REF_DOMINANCE_WARN = 0.65  # WARN if > 65%
+MIN_SEMANTIC_TYPES = 2     # Need at least 2 distinct semantic types
+
 CONFIDENCE_BANDS = {
     "structural": (0.95, 1.0),
     "regex": (0.85, 1.0),
@@ -368,6 +385,21 @@ def audit_a4_edge_integrity(edges_df: pd.DataFrame, nodes_df: pd.DataFrame) -> C
     node_ids = set(nodes_df["node_id"].tolist())
     node_texts = dict(zip(nodes_df["node_id"], nodes_df["text"].fillna("")))
 
+    # Check for duplicate edge IDs
+    if "edge_id" in edges_df.columns:
+        edge_id_counts = edges_df["edge_id"].value_counts()
+        duplicates = edge_id_counts[edge_id_counts > 1]
+        if len(duplicates) > 0:
+            for edge_id, count in duplicates.items():
+                failed_edges += count - 1  # Count extra occurrences as failures
+                findings.append(Finding(
+                    check_id="A4",
+                    severity="error",
+                    message=f"Duplicate edge_id found: '{edge_id}' appears {count} times",
+                    edge_id=edge_id,
+                    recommendation="Check dedupe logic in build_typed_edges or edge ID generation"
+                ))
+
     for _, row in edges_df.iterrows():
         edge_id = row.get("edge_id", "")
         edge_type = row.get("edge_type", "")
@@ -459,8 +491,125 @@ def audit_a4_edge_integrity(edges_df: pd.DataFrame, nodes_df: pd.DataFrame) -> C
     )
 
 
-def audit_a5_provenance_completeness(nodes_df: pd.DataFrame, sections_df: pd.DataFrame) -> CheckResult:
-    """A5: Provenance pointer completeness"""
+def audit_a5_skeleton_coverage(edges_df: pd.DataFrame, nodes_df: pd.DataFrame) -> CheckResult:
+    """A5: Skeleton edge coverage (critical for graph connectivity)
+
+    The graph MUST have structural skeleton edges to be usable for n-pair mining.
+    If skeleton edges = 0, the graph is unusable.
+    """
+    findings = []
+
+    # Count skeleton edge types
+    skeleton_types = {"parent_of", "follows", "in_section"}
+    skeleton_edges = edges_df[edges_df["edge_type"].isin(skeleton_types)]
+
+    parent_of_count = len(edges_df[edges_df["edge_type"] == "parent_of"])
+    follows_count = len(edges_df[edges_df["edge_type"] == "follows"])
+    in_section_count = len(edges_df[edges_df["edge_type"] == "in_section"])
+
+    total_skeleton = len(skeleton_edges)
+
+    findings.append(Finding(
+        check_id="A5",
+        severity="info",
+        message=f"Skeleton edges: parent_of={parent_of_count}, follows={follows_count}, in_section={in_section_count}",
+    ))
+
+    # HARD FAIL: No skeleton edges means graph is unusable
+    if total_skeleton == 0:
+        findings.append(Finding(
+            check_id="A5",
+            severity="error",
+            message="CRITICAL: No skeleton edges found - graph is unusable for n-pair mining",
+            recommendation="Run pipeline with structural skeleton generation enabled"
+        ))
+        return CheckResult(
+            check_id="A5",
+            check_name="Skeleton Edge Coverage",
+            passed=False,
+            total_items=1,
+            passed_items=0,
+            failed_items=1,
+            findings=findings
+        )
+
+    # Check connectivity: count connected components
+    from collections import defaultdict, deque
+
+    adj = defaultdict(set)
+    for _, row in edges_df.iterrows():
+        adj[row["source_node_id"]].add(row["target_node_id"])
+        adj[row["target_node_id"]].add(row["source_node_id"])
+
+    all_nodes = set(nodes_df["node_id"].tolist())
+    visited = set()
+    components = 0
+
+    for node in all_nodes:
+        if node not in visited:
+            components += 1
+            queue = deque([node])
+            while queue:
+                n = queue.popleft()
+                if n not in visited:
+                    visited.add(n)
+                    for neighbor in adj.get(n, []):
+                        if neighbor not in visited:
+                            queue.append(neighbor)
+
+    findings.append(Finding(
+        check_id="A5",
+        severity="info" if components <= 2 else "warning",
+        message=f"Connected components: {components} (target: 1-2)",
+        recommendation="Add more structural edges to reduce fragmentation" if components > 2 else None
+    ))
+
+    # Check for orphan nodes (no edges at all)
+    nodes_with_edges = set(edges_df["source_node_id"]) | set(edges_df["target_node_id"])
+    orphan_nodes = all_nodes - nodes_with_edges
+    orphan_count = len(orphan_nodes)
+
+    if orphan_count > 0:
+        findings.append(Finding(
+            check_id="A5",
+            severity="warning" if orphan_count < 5 else "error",
+            message=f"Orphan nodes (no edges): {orphan_count}",
+            recommendation="Attach orphan nodes to parent anchors or sections"
+        ))
+
+    # Check for self-edges
+    self_edges = edges_df[edges_df["source_node_id"] == edges_df["target_node_id"]]
+    if len(self_edges) > 0:
+        for _, row in self_edges.iterrows():
+            findings.append(Finding(
+                check_id="A5",
+                severity="error",
+                message=f"Self-edge found: {row['edge_type']} on {row['source_node_id']}",
+                edge_id=row.get("edge_id"),
+                recommendation="Drop self-edges in typed edge extraction"
+            ))
+
+    # Determine pass/fail
+    # Pass if: skeleton > 0, components <= 3, no self-edges
+    passed = (
+        total_skeleton > 0 and
+        components <= 3 and
+        len(self_edges) == 0
+    )
+
+    return CheckResult(
+        check_id="A5",
+        check_name="Skeleton Edge Coverage",
+        passed=passed,
+        total_items=total_skeleton,
+        passed_items=total_skeleton if passed else 0,
+        failed_items=0 if passed else 1,
+        findings=findings
+    )
+
+
+def audit_a6_provenance_completeness(nodes_df: pd.DataFrame, sections_df: pd.DataFrame) -> CheckResult:
+    """A6: Provenance pointer completeness"""
     findings = []
     missing_provenance = 0
 
@@ -487,7 +636,7 @@ def audit_a5_provenance_completeness(nodes_df: pd.DataFrame, sections_df: pd.Dat
             if _is_empty(row.get(field)):
                 missing_provenance += 1
                 findings.append(Finding(
-                    check_id="A5",
+                    check_id="A6",
                     severity="error",
                     message=f"Missing required provenance field: {field}",
                     node_id=node_id,
@@ -498,7 +647,7 @@ def audit_a5_provenance_completeness(nodes_df: pd.DataFrame, sections_df: pd.Dat
         for field in recommended_fields:
             if _is_empty(row.get(field)):
                 findings.append(Finding(
-                    check_id="A5",
+                    check_id="A6",
                     severity="info",
                     message=f"Missing recommended field: {field}",
                     node_id=node_id
@@ -511,7 +660,7 @@ def audit_a5_provenance_completeness(nodes_df: pd.DataFrame, sections_df: pd.Dat
         if not has_elements:
             if row.get("anchor_type") == "box":
                 findings.append(Finding(
-                    check_id="A5",
+                    check_id="A6",
                     severity="warning",
                     message=f"Section missing element_ids for pointer resolution",
                     node_id=row["anchor_id"],
@@ -521,12 +670,377 @@ def audit_a5_provenance_completeness(nodes_df: pd.DataFrame, sections_df: pd.Dat
     total_checks = len(nodes_df) * len(required_fields)
 
     return CheckResult(
-        check_id="A5",
+        check_id="A6",
         check_name="Provenance Completeness",
         passed=missing_provenance == 0,
         total_items=total_checks,
         passed_items=total_checks - missing_provenance,
         failed_items=missing_provenance,
+        findings=findings
+    )
+
+
+def audit_a7_hierarchy_integrity(edges_df: pd.DataFrame, nodes_df: pd.DataFrame) -> CheckResult:
+    """A7: Hierarchy integrity (parent_of forms a valid tree)
+
+    Three independent checks:
+    1. Parent cardinality: roots=0 parents, non-roots=exactly 1 parent
+    2. Acyclicity: no cycles in parent_of subgraph (DFS with coloring)
+    3. Depth bound: reachable nodes have depth <= MAX_HIERARCHY_DEPTH
+
+    These are hard requirements for n-pair mining and graph traversal.
+    """
+    findings = []
+
+    # Get parent_of edges (direction: source=parent, target=child)
+    parent_of_edges = edges_df[edges_df["edge_type"] == "parent_of"]
+
+    if parent_of_edges.empty:
+        findings.append(Finding(
+            check_id="A7",
+            severity="error",
+            message="No parent_of edges found - hierarchy is undefined",
+            recommendation="Run edge builder with structural skeleton enabled"
+        ))
+        return CheckResult(
+            check_id="A7",
+            check_name="Hierarchy Integrity",
+            passed=False,
+            total_items=1,
+            passed_items=0,
+            failed_items=1,
+            findings=findings
+        )
+
+    # Build child → parents map (set to handle 3+ parents correctly)
+    child_to_parents: Dict[str, set] = defaultdict(set)
+    for _, row in parent_of_edges.iterrows():
+        parent = row["source_node_id"]
+        child = row["target_node_id"]
+        child_to_parents[child].add(parent)
+
+    # Identify roots: nodes with 0 incoming parent_of edges
+    # Accept doc_root node_type OR inferred roots (no parents)
+    all_nodes = set(nodes_df["node_id"].tolist())
+    nodes_with_parents = set(child_to_parents.keys())
+    inferred_roots = all_nodes - nodes_with_parents
+
+    # Explicit roots from node_type (doc_root, preamble treated as root-ish)
+    explicit_root_types = {"doc_root"}
+    explicit_roots = set(
+        nodes_df[nodes_df["node_type"].isin(explicit_root_types)]["node_id"].tolist()
+    )
+
+    # Final root set: explicit OR inferred (0 parents)
+    root_nodes = explicit_roots | inferred_roots
+
+    # =========================================================================
+    # CHECK 1: Parent cardinality
+    # =========================================================================
+    multi_parent_nodes = []
+    orphan_nodes = []
+
+    for node in all_nodes:
+        parent_count = len(child_to_parents.get(node, set()))
+
+        if node in root_nodes:
+            # Roots should have 0 parents
+            if parent_count > 0:
+                # Root with parent is weird but not fatal - just note it
+                findings.append(Finding(
+                    check_id="A7",
+                    severity="warning",
+                    message=f"Root node has {parent_count} parent(s): {node}",
+                    node_id=node,
+                ))
+        else:
+            # Non-roots must have exactly 1 parent
+            if parent_count == 0:
+                orphan_nodes.append(node)
+            elif parent_count > 1:
+                multi_parent_nodes.append((node, list(child_to_parents[node])))
+
+    # Report multi-parent errors
+    if multi_parent_nodes:
+        for node, parents in multi_parent_nodes[:5]:
+            findings.append(Finding(
+                check_id="A7",
+                severity="error",
+                message=f"Node has {len(parents)} parents: {node.split(':')[-1]}",
+                node_id=node,
+                evidence=f"Parents: {[p.split(':')[-1] for p in parents]}",
+                recommendation="Check edge builder dedupe or containment logic"
+            ))
+        if len(multi_parent_nodes) > 5:
+            findings.append(Finding(
+                check_id="A7",
+                severity="error",
+                message=f"... and {len(multi_parent_nodes) - 5} more multi-parent nodes"
+            ))
+
+    # Report orphan errors
+    if orphan_nodes:
+        findings.append(Finding(
+            check_id="A7",
+            severity="error",
+            message=f"{len(orphan_nodes)} non-root nodes have no parent",
+            evidence=f"Sample: {[n.split(':')[-1] for n in orphan_nodes[:5]]}",
+            recommendation="Ensure edge builder emits parent_of for all non-root nodes"
+        ))
+
+    # =========================================================================
+    # CHECK 2: Cycle detection (DFS with WHITE/GRAY/BLACK coloring)
+    # =========================================================================
+    WHITE, GRAY, BLACK = 0, 1, 2
+    color: Dict[str, int] = defaultdict(int)  # WHITE by default
+    cycles_found = []
+
+    # Build parent → children adjacency for DFS
+    parent_to_children: Dict[str, List[str]] = defaultdict(list)
+    for child, parents in child_to_parents.items():
+        for parent in parents:
+            parent_to_children[parent].append(child)
+
+    def dfs_cycle_detect(node: str, path: List[str]) -> None:
+        color[node] = GRAY
+        for child in parent_to_children.get(node, []):
+            if color[child] == GRAY:
+                # Back edge = cycle
+                cycle_start = path.index(child) if child in path else len(path)
+                cycle = path[cycle_start:] + [child]
+                cycles_found.append(cycle)
+            elif color[child] == WHITE:
+                dfs_cycle_detect(child, path + [child])
+        color[node] = BLACK
+
+    # Start DFS from all roots
+    for root in root_nodes:
+        if color[root] == WHITE:
+            dfs_cycle_detect(root, [root])
+
+    # Also check nodes not reachable from roots (disconnected cycles)
+    for node in all_nodes:
+        if color[node] == WHITE:
+            dfs_cycle_detect(node, [node])
+
+    if cycles_found:
+        for cycle in cycles_found[:3]:
+            cycle_str = " → ".join(n.split(":")[-1] for n in cycle[:6])
+            if len(cycle) > 6:
+                cycle_str += f" → ... ({len(cycle)} nodes)"
+            findings.append(Finding(
+                check_id="A7",
+                severity="error",
+                message=f"Cycle in parent_of: {cycle_str}",
+                recommendation="Check edge builder state machine for containment bugs"
+            ))
+
+    # =========================================================================
+    # CHECK 3: Depth bounds (only for nodes reachable from roots)
+    # =========================================================================
+    depth_map: Dict[str, int] = {}
+    deep_nodes = []
+    max_depth = 0
+
+    # BFS from roots to compute depth
+    from collections import deque
+    queue = deque()
+    for root in root_nodes:
+        depth_map[root] = 0
+        queue.append(root)
+
+    while queue:
+        node = queue.popleft()
+        node_depth = depth_map[node]
+        for child in parent_to_children.get(node, []):
+            if child not in depth_map:
+                child_depth = node_depth + 1
+                depth_map[child] = child_depth
+                if child_depth > max_depth:
+                    max_depth = child_depth
+                if child_depth > MAX_HIERARCHY_DEPTH:
+                    deep_nodes.append((child, child_depth))
+                queue.append(child)
+
+    findings.append(Finding(
+        check_id="A7",
+        severity="info",
+        message=f"Max depth: {max_depth} (limit: {MAX_HIERARCHY_DEPTH}), roots: {len(root_nodes)}"
+    ))
+
+    if deep_nodes:
+        for node, d in deep_nodes[:3]:
+            findings.append(Finding(
+                check_id="A7",
+                severity="error",
+                message=f"Node exceeds depth limit: {node.split(':')[-1]} at depth {d}",
+                node_id=node,
+                recommendation="Check anchor_type classification"
+            ))
+
+    # Unreachable nodes (not in depth_map after BFS)
+    unreachable = all_nodes - set(depth_map.keys())
+    if unreachable and unreachable != set(orphan_nodes):
+        # Some nodes unreachable but not already flagged as orphans
+        extra_unreachable = unreachable - set(orphan_nodes)
+        if extra_unreachable:
+            findings.append(Finding(
+                check_id="A7",
+                severity="warning",
+                message=f"{len(extra_unreachable)} nodes unreachable from roots",
+                evidence=f"Sample: {[n.split(':')[-1] for n in list(extra_unreachable)[:3]]}"
+            ))
+
+    # =========================================================================
+    # Summary
+    # =========================================================================
+    non_root_count = len(all_nodes) - len(root_nodes)
+    cardinality_failures = len(multi_parent_nodes) + len(orphan_nodes)
+    nodes_with_one_parent = non_root_count - cardinality_failures
+
+    findings.append(Finding(
+        check_id="A7",
+        severity="info",
+        message=f"Cardinality: {nodes_with_one_parent}/{non_root_count} non-root nodes have exactly 1 parent"
+    ))
+
+    passed = (
+        len(multi_parent_nodes) == 0 and
+        len(orphan_nodes) == 0 and
+        len(cycles_found) == 0 and
+        len(deep_nodes) == 0
+    )
+
+    return CheckResult(
+        check_id="A7",
+        check_name="Hierarchy Integrity",
+        passed=passed,
+        total_items=non_root_count,
+        passed_items=nodes_with_one_parent,
+        failed_items=cardinality_failures,
+        findings=findings
+    )
+
+
+def audit_a8_edge_type_distribution(edges_df: pd.DataFrame, nodes_df: pd.DataFrame) -> CheckResult:
+    """A8: Edge-type distribution (semantic diversity)
+
+    Checks:
+    1. At least one semantic edge exists (not reference-only)
+    2. references_box doesn't dominate non-structural edges (≤80%)
+    3. At least 2 distinct semantic types present
+    4. Negative knowledge (excludes) presence (warning only)
+
+    These ensure the graph has meaningful semantic content for n-pair mining.
+    """
+    findings = []
+    failed = 0
+
+    # Count edges by type
+    edge_type_counts = edges_df["edge_type"].value_counts(dropna=False).to_dict()
+
+    structural_n = sum(edge_type_counts.get(t, 0) for t in STRUCTURAL_EDGE_TYPES)
+    reference_n = sum(edge_type_counts.get(t, 0) for t in REFERENCE_EDGE_TYPES)
+    semantic_n = sum(edge_type_counts.get(t, 0) for t in SEMANTIC_EDGE_TYPES)
+
+    # Which semantic types are present?
+    present_semantic_types = [
+        t for t in SEMANTIC_EDGE_TYPES if edge_type_counts.get(t, 0) > 0
+    ]
+
+    # Info: distribution summary
+    findings.append(Finding(
+        check_id="A8",
+        severity="info",
+        message=f"Edge distribution: structural={structural_n}, reference={reference_n}, semantic={semantic_n}",
+    ))
+
+    # Semantic type histogram
+    if present_semantic_types:
+        type_hist = ", ".join(
+            f"{t}={edge_type_counts.get(t, 0)}" for t in sorted(present_semantic_types)
+        )
+        findings.append(Finding(
+            check_id="A8",
+            severity="info",
+            message=f"Semantic types: {type_hist}",
+        ))
+
+    # =========================================================================
+    # CHECK 1: At least one semantic edge exists
+    # =========================================================================
+    if semantic_n == 0:
+        failed += 1
+        findings.append(Finding(
+            check_id="A8",
+            severity="error",
+            message="No semantic edges present (graph is reference-only)",
+            evidence=f"structural={structural_n}, reference={reference_n}, semantic=0",
+            recommendation="Implement typed edges (applies_if/defines/qualifies/requires/excludes)"
+        ))
+
+    # =========================================================================
+    # CHECK 2: references_box dominance cap
+    # =========================================================================
+    non_structural_n = reference_n + semantic_n
+    if non_structural_n > 0:
+        ref_box_n = edge_type_counts.get("references_box", 0)
+        ref_ratio = ref_box_n / non_structural_n
+
+        if ref_ratio > REF_DOMINANCE_FAIL:
+            failed += 1
+            findings.append(Finding(
+                check_id="A8",
+                severity="error",
+                message=f"references_box dominates non-structural edges ({ref_ratio:.0%} > {REF_DOMINANCE_FAIL:.0%})",
+                evidence=f"references_box={ref_box_n}, semantic={semantic_n}",
+                recommendation="Increase typed edge recall or reduce low-value references_box edges"
+            ))
+        elif ref_ratio > REF_DOMINANCE_WARN:
+            findings.append(Finding(
+                check_id="A8",
+                severity="warning",
+                message=f"references_box ratio is high ({ref_ratio:.0%} > {REF_DOMINANCE_WARN:.0%})",
+                evidence=f"references_box={ref_box_n}, semantic={semantic_n}",
+                recommendation="Track this ratio as typed edge coverage improves"
+            ))
+
+    # =========================================================================
+    # CHECK 3: Semantic type diversity
+    # =========================================================================
+    if semantic_n > 0 and len(present_semantic_types) < MIN_SEMANTIC_TYPES:
+        failed += 1
+        findings.append(Finding(
+            check_id="A8",
+            severity="error",
+            message=f"Insufficient semantic diversity ({len(present_semantic_types)} type < {MIN_SEMANTIC_TYPES} required)",
+            evidence=f"present={present_semantic_types}",
+            recommendation="Ensure at least 2 of: defines/qualifies/applies_if/requires/excludes/includes"
+        ))
+
+    # =========================================================================
+    # CHECK 4: Negative knowledge presence (warning only)
+    # =========================================================================
+    excludes_n = edge_type_counts.get("excludes", 0)
+    if excludes_n == 0:
+        findings.append(Finding(
+            check_id="A8",
+            severity="warning",
+            message="No excludes edges found (negative knowledge gap)",
+            evidence="excludes=0",
+            recommendation="Add negation templates to capture 'does not include' / 'is not' patterns"
+        ))
+
+    # Summary
+    passed = (failed == 0)
+
+    return CheckResult(
+        check_id="A8",
+        check_name="Edge-Type Distribution",
+        passed=passed,
+        total_items=non_structural_n,
+        passed_items=semantic_n,
+        failed_items=failed,
         findings=findings
     )
 
@@ -816,8 +1330,17 @@ def run_validation(output_dir: str = "output") -> QualityReport:
     print("  A4: Edge Integrity...")
     report.add_check(audit_a4_edge_integrity(edges_df, nodes_df))
 
-    print("  A5: Provenance Completeness...")
-    report.add_check(audit_a5_provenance_completeness(nodes_df, sections_df))
+    print("  A5: Skeleton Edge Coverage...")
+    report.add_check(audit_a5_skeleton_coverage(edges_df, nodes_df))
+
+    print("  A6: Provenance Completeness...")
+    report.add_check(audit_a6_provenance_completeness(nodes_df, sections_df))
+
+    print("  A7: Hierarchy Integrity...")
+    report.add_check(audit_a7_hierarchy_integrity(edges_df, nodes_df))
+
+    print("  A8: Edge-Type Distribution...")
+    report.add_check(audit_a8_edge_type_distribution(edges_df, nodes_df))
 
     # Phase B: LLM-as-Judge (placeholders)
     print("\n[Phase B] LLM-as-Judge (Placeholders)")
