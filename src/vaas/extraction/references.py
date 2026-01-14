@@ -63,6 +63,7 @@ class Reference:
 
     Attributes:
         ref_id: Unique identifier for this reference.
+        doc_id: Document identifier for provenance.
         source_element_id: Element where reference was found.
         source_anchor_id: Anchor containing the source element.
         ref_type: Type of reference (box_reference, publication, irc_section, form_reference).
@@ -78,6 +79,7 @@ class Reference:
     """
 
     ref_id: str
+    doc_id: Optional[str]
     source_element_id: str
     source_anchor_id: Optional[str]
     ref_type: str
@@ -95,6 +97,7 @@ class Reference:
         """Convert to dictionary for DataFrame construction."""
         return {
             "ref_id": self.ref_id,
+            "doc_id": self.doc_id,
             "source_element_id": self.source_element_id,
             "source_anchor_id": self.source_anchor_id,
             "ref_type": self.ref_type,
@@ -255,11 +258,36 @@ def generate_ref_id(
     return f"ref_{ref_type[:3]}_{hash_suffix}"
 
 
+def generate_ref_occurrence_id(
+    doc_id: Optional[str],
+    source_element_id: Optional[str],
+    sentence_idx: Optional[int],
+    char_start: Optional[int],
+    char_end: Optional[int],
+    ref_text: Optional[str],
+    ref_type: Optional[str],
+    target_anchor_id: Optional[str] = None,
+) -> str:
+    """Create stable surrogate key for an individual reference occurrence."""
+    parts = [
+        doc_id or "",
+        source_element_id or "",
+        "" if sentence_idx is None else str(sentence_idx),
+        "" if char_start is None else str(char_start),
+        "" if char_end is None else str(char_end),
+        ref_text or "",
+        ref_type or "",
+        target_anchor_id or "",
+    ]
+    return f"refocc_{stable_hash(parts, length=12)}"
+
+
 # =============================================================================
 # REFERENCE EXTRACTION
 # =============================================================================
 
 def extract_references_from_element(
+    doc_id: Optional[str],
     element_id: str,
     text: str,
     anchor_id: Optional[str],
@@ -324,6 +352,7 @@ def extract_references_from_element(
             references.append(
                 Reference(
                     ref_id=generate_ref_id(element_id, "box", position),
+                    doc_id=doc_id,
                     source_element_id=element_id,
                     source_anchor_id=anchor_id,
                     ref_type="box_reference",
@@ -348,6 +377,7 @@ def extract_references_from_element(
         references.append(
             Reference(
                 ref_id=generate_ref_id(element_id, "pub", position),
+                doc_id=doc_id,
                 source_element_id=element_id,
                 source_anchor_id=anchor_id,
                 ref_type="publication",
@@ -372,6 +402,7 @@ def extract_references_from_element(
         references.append(
             Reference(
                 ref_id=generate_ref_id(element_id, "irc", position),
+                doc_id=doc_id,
                 source_element_id=element_id,
                 source_anchor_id=anchor_id,
                 ref_type="irc_section",
@@ -396,6 +427,7 @@ def extract_references_from_element(
         references.append(
             Reference(
                 ref_id=generate_ref_id(element_id, "form", position),
+                doc_id=doc_id,
                 source_element_id=element_id,
                 source_anchor_id=anchor_id,
                 ref_type="form_reference",
@@ -416,6 +448,7 @@ def extract_references_from_element(
 
 def extract_references(
     elements_df: pd.DataFrame,
+    doc_id: str,
     valid_box_keys: Optional[Set[str]] = None,
     context_chars: int = 50,
     skip_roles: Optional[Set[str]] = None,
@@ -425,7 +458,7 @@ def extract_references(
     anchor_id_col: str = "anchor_id",
     role_col: str = "role",
     page_col: str = "page",
-    deduplicate: bool = True,
+    deduplicate: bool = False,
 ) -> ReferenceExtractionResult:
     """
     Extract references from all elements in a DataFrame.
@@ -435,6 +468,7 @@ def extract_references(
 
     Args:
         elements_df: DataFrame with element data.
+        doc_id: Document identifier for stable IDs.
         valid_box_keys: Set of known box keys for target_exists check.
         context_chars: Characters of context for evidence quotes.
         skip_roles: Roles to skip (e.g., {"PageArtifact"}).
@@ -484,6 +518,7 @@ def extract_references(
 
         # Extract references from this element
         refs = extract_references_from_element(
+            doc_id=doc_id,
             element_id=element_id,
             text=str(text),
             anchor_id=anchor_id,
@@ -622,54 +657,3 @@ def get_reference_summary(references_df: pd.DataFrame) -> Dict[str, Any]:
     }
 
 
-# =============================================================================
-# LEGACY COMPATIBILITY
-# =============================================================================
-
-def extract_references_legacy(
-    elements_df: pd.DataFrame,
-    sections_df: pd.DataFrame,
-    role_page_artifact: str = "PageArtifact",
-) -> pd.DataFrame:
-    """
-    Legacy-compatible wrapper for extract_references.
-
-    Matches the original run_pipeline.py behavior for drop-in replacement.
-
-    Args:
-        elements_df: Elements DataFrame with anchor_id assignments.
-        sections_df: Sections DataFrame to check target existence.
-        role_page_artifact: Role value for page artifacts.
-
-    Returns:
-        References DataFrame in legacy format.
-    """
-    # Get valid box keys from sections
-    box_sections = sections_df[sections_df["anchor_type"] == "box"] if not sections_df.empty else pd.DataFrame()
-    valid_box_keys = set()
-    if not box_sections.empty and "anchor_id" in box_sections.columns:
-        # Extract box key from anchor_id (e.g., "box_1a" -> "1a")
-        for aid in box_sections["anchor_id"]:
-            if aid.startswith("box_"):
-                valid_box_keys.add(aid[4:])
-
-    result = extract_references(
-        elements_df,
-        valid_box_keys=valid_box_keys,
-        skip_roles={role_page_artifact, "page_artifact"},
-        skip_anchor_ids={"unassigned", ""},
-    )
-
-    # Print summary (matching original behavior)
-    if result.total > 0:
-        print(f"\nReferences extracted: {result.total}")
-        print(f"\nReference types:")
-        if not result.references_df.empty:
-            print(result.references_df["ref_type"].value_counts().to_string())
-
-        internal = filter_internal_box_references(result.references_df)
-        print(f"\n--- Internal Box References ({len(internal)}) ---")
-        for _, r in internal.head(15).iterrows():
-            print(f"  {r['source_anchor_id']} -> {r['target_anchor_id']}: \"{r['ref_text'][:40]}\"")
-
-    return result.references_df
