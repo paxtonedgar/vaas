@@ -532,57 +532,6 @@ def materialize_sections(
 
 
 # =============================================================================
-# LEGACY COMPATIBILITY
-# =============================================================================
-
-def materialize_sections_legacy(
-    elements_df: pd.DataFrame,
-    anchor_timeline: pd.DataFrame,
-    role_box_header: str = "box_header",
-    role_section_header: str = "section_header",
-    role_subsection_header: str = "subsection_header",
-    role_page_artifact: str = "PageArtifact",
-) -> pd.DataFrame:
-    """
-    Legacy-compatible wrapper for materialize_sections.
-
-    Matches original run_pipeline.py behavior for drop-in replacement.
-
-    Args:
-        elements_df: Elements DataFrame with anchor_id assigned.
-        anchor_timeline: Anchor timeline DataFrame.
-        role_box_header: Role value for box headers.
-        role_section_header: Role value for section headers.
-        role_subsection_header: Role value for subsection headers.
-        role_page_artifact: Role value for page artifacts.
-
-    Returns:
-        Sections DataFrame in original format.
-    """
-    header_roles = {role_box_header, role_section_header, role_subsection_header}
-    artifact_roles = {role_page_artifact, "page_artifact"}
-
-    result = materialize_sections(
-        elements_df=elements_df,
-        anchors_df=anchor_timeline,
-        anchor_timeline_df=anchor_timeline,
-        header_roles=header_roles,
-        artifact_roles=artifact_roles,
-    )
-
-    # Print summary (matching original behavior)
-    print(f"\nSections created: {result.total_sections}")
-
-    if not result.sections_df.empty:
-        print("\n--- Section Summary ---")
-        for _, r in result.sections_df.iterrows():
-            label = r.get("label", "")[:30]
-            print(f"  {r['anchor_id']}: {r['element_count']} elements, {r['char_count']} chars - {label}...")
-
-    return result.sections_df
-
-
-# =============================================================================
 # UTILITIES
 # =============================================================================
 

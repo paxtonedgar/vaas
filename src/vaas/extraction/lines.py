@@ -372,20 +372,3 @@ def build_lines_with_features(
     )
 
 
-# Legacy wrapper
-def build_lines_legacy(
-    spans_df: pd.DataFrame,
-    body_size: float,
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Legacy wrapper returning (line_df, col_info_df).
-
-    For drop-in replacement in run_pipeline.py.
-    """
-    result = build_lines_with_features(spans_df, body_size)
-
-    print(f"Lines: {result.line_count}")
-    two_col_pages = result.col_info_df[result.col_info_df["num_columns"] == 2] if not result.col_info_df.empty else pd.DataFrame()
-    print(f"Column detection: {len(two_col_pages)}/{len(result.col_info_df)} pages have 2 columns")
-
-    return result.line_df, result.col_info_df

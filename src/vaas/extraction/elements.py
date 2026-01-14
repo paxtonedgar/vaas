@@ -177,12 +177,25 @@ def split_blocks_into_elements(
         # Assign column based on x position
         elements_df["x_column"] = (elements_df["geom_x0"] >= page_mid_x).astype(int)
 
-        # Sort by reading order (left column first, then right)
+        # Sort by reading order (page, column, y0, x0)
+        # This is the canonical document order
         elements_df = elements_df.sort_values(
             ["doc_id", "page", "x_column", "geom_y0", "geom_x0", "element_id"],
             kind="mergesort"
         )
-        elements_df["reading_order"] = elements_df.groupby(["doc_id", "page"]).cumcount()
+
+        # doc_reading_order: document-global, strictly increasing 0..N-1
+        # This is the canonical order used for cross-page timeline logic
+        elements_df["doc_reading_order"] = elements_df.groupby("doc_id").cumcount()
+
+        # page_reading_order: page-local, for debugging/page-specific logic only
+        # DO NOT use this for any cross-page comparison or interval assignment
+        elements_df["page_reading_order"] = elements_df.groupby(["doc_id", "page"]).cumcount()
+
+        # Keep 'reading_order' as alias for doc_reading_order for backward compatibility
+        # All downstream code should treat reading_order as document-global
+        elements_df["reading_order"] = elements_df["doc_reading_order"]
+
         elements_df = elements_df.reset_index(drop=True)
 
     logger.info(f"Split into {len(elements_df)} elements")
@@ -313,37 +326,3 @@ def classify_elements_with_result(
     )
 
 
-# =============================================================================
-# LEGACY WRAPPERS
-# =============================================================================
-
-def split_and_classify_legacy(
-    line_df: pd.DataFrame,
-    page_mid_x: float = 300.0,
-) -> pd.DataFrame:
-    """
-    Legacy wrapper for split + classify pipeline.
-
-    For drop-in replacement in run_pipeline.py.
-    """
-    # Split
-    split_count = int(line_df["split_trigger"].sum()) if "split_trigger" in line_df.columns else 0
-    elements_df = split_blocks_into_elements(line_df, page_mid_x)
-
-    print(f"Lines: {len(line_df)}")
-    print(f"Elements after split: {len(elements_df)}")
-    print(f"Split triggers found: {split_count}")
-
-    # Classify
-    elements_df = classify_elements(elements_df)
-
-    print("Role distribution:")
-    print(elements_df["role"].value_counts().to_string())
-
-    # Show box headers
-    box_headers = elements_df[elements_df["role"] == ROLE_BOX_HEADER]
-    print(f"\n--- Box Headers Found ({len(box_headers)}) ---")
-    for _, r in box_headers.head(25).iterrows():
-        print(f"  p{r['page']}: {r['text'][:70]}...")
-
-    return elements_df

@@ -5,7 +5,6 @@ from .pdf import (
     extract_spans_from_pdf,
     infer_body_font_size,
     get_font_size_distribution,
-    extract_spans_legacy,
 )
 
 from .lines import (
@@ -20,7 +19,6 @@ from .lines import (
     add_page_marker_flags,
     add_structural_filters,
     build_lines_with_features,
-    build_lines_legacy,
     # Regex patterns
     BOX_STRONG_RX,
     BOX_WEAK_RX,
@@ -37,7 +35,6 @@ from .elements import (
     split_elements_with_result,
     classify_elements,
     classify_elements_with_result,
-    split_and_classify_legacy,
     # Constants
     ROLE_BOX_HEADER,
     ROLE_SECTION_HEADER,
@@ -135,8 +132,6 @@ from .references import (
     filter_internal_box_references,
     filter_external_references,
     get_reference_summary,
-    # Legacy
-    extract_references_legacy,
 )
 
 from .sections import (
@@ -151,7 +146,6 @@ from .sections import (
     # Main materialization
     materialize_section,
     materialize_sections,
-    materialize_sections_legacy,
     # Utilities
     filter_sections_by_type,
     get_section_by_anchor_id,
@@ -164,7 +158,6 @@ __all__ = [
     "extract_spans_from_pdf",
     "infer_body_font_size",
     "get_font_size_distribution",
-    "extract_spans_legacy",
     # Line building
     "LineBuildResult",
     "build_line_dataframe",
@@ -177,7 +170,6 @@ __all__ = [
     "add_page_marker_flags",
     "add_structural_filters",
     "build_lines_with_features",
-    "build_lines_legacy",
     "BOX_STRONG_RX",
     "BOX_WEAK_RX",
     "SECTION_HDR_RX",
@@ -191,7 +183,6 @@ __all__ = [
     "split_elements_with_result",
     "classify_elements",
     "classify_elements_with_result",
-    "split_and_classify_legacy",
     "ROLE_BOX_HEADER",
     "ROLE_SECTION_HEADER",
     "ROLE_SUBSECTION_HEADER",
@@ -264,7 +255,6 @@ __all__ = [
     "filter_internal_box_references",
     "filter_external_references",
     "get_reference_summary",
-    "extract_references_legacy",
     # Section materialization
     "Section",
     "SectionMaterializationResult",
@@ -274,7 +264,6 @@ __all__ = [
     "build_anchor_to_elements_map",
     "materialize_section",
     "materialize_sections",
-    "materialize_sections_legacy",
     "filter_sections_by_type",
     "get_section_by_anchor_id",
     "get_sections_summary",

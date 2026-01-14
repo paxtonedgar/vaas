@@ -140,19 +140,3 @@ def get_font_size_distribution(spans_df: pd.DataFrame, top_n: int = 5) -> pd.Ser
     return sizes.value_counts().head(top_n)
 
 
-# Legacy wrapper for backward compatibility
-def extract_spans_legacy(
-    pdf_path: str,
-    doc_id: str = "1099div_filer",
-) -> Tuple[pd.DataFrame, int]:
-    """
-    Legacy wrapper returning (spans_df, page_count).
-
-    For drop-in replacement in run_pipeline.py.
-    """
-    result = extract_spans_from_pdf(pdf_path, doc_id)
-
-    print(f"Pages: {result.page_count}")
-    print(f"Spans extracted: {len(result.spans_df)}")
-
-    return result.spans_df, result.page_count
