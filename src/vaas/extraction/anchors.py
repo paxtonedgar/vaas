@@ -28,6 +28,7 @@ import numpy as np
 import pandas as pd
 
 from vaas.utils.text import stable_hash, slug_title
+from vaas.constants import ROLE_BOX_HEADER, ROLE_SECTION_HEADER, ROLE_SUBSECTION_HEADER
 
 
 logger = logging.getLogger(__name__)
@@ -492,9 +493,9 @@ def deduplicate_anchors(
 
 def extract_anchors(
     elements_df: pd.DataFrame,
-    role_box_header: str = "box_header",
-    role_section_header: str = "section_header",
-    role_subsection_header: str = "subsection_header",
+    role_box_header: str = ROLE_BOX_HEADER,
+    role_section_header: str = ROLE_SECTION_HEADER,
+    role_subsection_header: str = ROLE_SUBSECTION_HEADER,
     section_map: Optional[Dict[str, str]] = None,
 ) -> AnchorExtractionResult:
     """
@@ -714,11 +715,12 @@ def build_anchor_timeline(
     # Use element reading order if available, fall back to anchor reading order
     timeline["start_reading_order"] = timeline["reading_order_elem"].fillna(
         timeline["reading_order"]
-    )
+    ).astype(float)  # Ensure numeric dtype for IntervalIndex
     timeline = timeline.sort_values(["page", "start_reading_order"]).reset_index(drop=True)
 
     # Compute end_reading_order for each anchor
-    timeline["end_reading_order"] = None
+    # Initialize with np.nan (float) to ensure numeric dtype for IntervalIndex
+    timeline["end_reading_order"] = np.nan
 
     for page in timeline["page"].unique():
         page_mask = timeline["page"] == page
@@ -975,9 +977,9 @@ def assign_elements_to_anchors(
 
 def extract_and_assign_anchors(
     elements_df: pd.DataFrame,
-    role_box_header: str = "box_header",
-    role_section_header: str = "section_header",
-    role_subsection_header: str = "subsection_header",
+    role_box_header: str = ROLE_BOX_HEADER,
+    role_section_header: str = ROLE_SECTION_HEADER,
+    role_subsection_header: str = ROLE_SUBSECTION_HEADER,
     section_map: Optional[Dict[str, str]] = None,
     expected_boxes: Optional[Set[str]] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, AnchorTimeline, Optional[BoxValidationResult]]:
