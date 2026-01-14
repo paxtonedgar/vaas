@@ -5,7 +5,7 @@ Resolver Contract
 1) Input: claims.parquet, claim_precedence.parquet
 2) Group key: (precedence_scope_id, topic_key); if topic_key_source != canonical_ids,
    group by predicate within precedence_scope_id and use topic_key = predicate|scope:<scope>
-3) Required edges: precedes forms a chain (N-1) when competition exists; else SKIP_NO_COMPETITION
+3) Required edges: precedes forms a chain (N-1) when competition exists; else SKIP_SINGLETON/SKIP_NO_EDGES
 4) Statuses: applies | suppressed | exception | undecidable
 5) Tie-breaker: (source_element_id, sentence_idx, char_start, claim_id)
 6) Failure: malformed graphs => ERROR_GRAPH and no applies without error recording
@@ -27,7 +27,8 @@ from vaas.semantic.policy import precedence_sentence_distance_limit
 
 ALLOWED_STATUSES = {"applies", "suppressed", "exception", "undecidable"}
 GROUP_STATUS_ERROR = "ERROR_GRAPH"
-GROUP_STATUS_SKIP = "SKIP_NO_COMPETITION"
+GROUP_STATUS_SKIP_SINGLETON = "SKIP_SINGLETON"
+GROUP_STATUS_SKIP_NO_EDGES = "SKIP_NO_EDGES"
 GROUP_STATUS_RESOLVED = "RESOLVED"
 
 
@@ -35,6 +36,7 @@ def resolve_claims(
     claims_df: pd.DataFrame,
     precedence_df: pd.DataFrame,
     output_dir: Path,
+    emit_singletons: bool = False,
 ) -> Dict[str, int]:
     """Resolve claims into ordered groups + statuses."""
     required = {"claim_id", "precedence_scope_id", "topic_key", "topic_key_source", "predicate"}
@@ -68,23 +70,46 @@ def resolve_claims(
         chain_order: List[str] = []
 
         if len(group_claims) < 2:
-            status = GROUP_STATUS_SKIP
-            chain_order = list(group_claims["claim_id"].astype(str))
+            status = GROUP_STATUS_SKIP_SINGLETON
+            error_code = "single_claim"
         else:
             error_code, error_detail = _validate_group_edges(group_claims, group_edges, group_ids)
             if error_code:
-                status = GROUP_STATUS_ERROR
-                chain_order = list(group_claims["claim_id"].astype(str))
-            else:
+                if error_code == "missing_precedes":
+                    status = GROUP_STATUS_SKIP_NO_EDGES
+                else:
+                    status = GROUP_STATUS_ERROR
+            if status == GROUP_STATUS_RESOLVED:
                 chain_order = _build_chain(group_edges["precedes"], group_ids)
+            elif status == GROUP_STATUS_ERROR:
+                chain_order = list(group_claims["claim_id"].astype(str))
 
-        resolved = _resolve_group_rows(
-            group_claims,
-            chain_order,
-            group_edges["exception_of"],
-            status,
-            error_code,
-        )
+        resolved: List[ResolvedClaimRow] = []
+        if status == GROUP_STATUS_RESOLVED:
+            resolved = _resolve_group_rows(
+                group_claims,
+                chain_order,
+                group_edges["exception_of"],
+                status,
+                error_code,
+            )
+        elif status == GROUP_STATUS_ERROR:
+            resolved = _resolve_group_rows(
+                group_claims,
+                chain_order,
+                group_edges["exception_of"],
+                status,
+                error_code,
+            )
+        elif status == GROUP_STATUS_SKIP_SINGLETON and emit_singletons:
+            chain_order = list(group_claims["claim_id"].astype(str))
+            resolved = _resolve_group_rows(
+                group_claims,
+                chain_order,
+                group_edges["exception_of"],
+                status,
+                error_code,
+            )
         resolved_rows.extend(resolved)
 
         counts = _status_counts(resolved)
@@ -110,11 +135,12 @@ def resolve_claims(
             group_status=status,
             error_code=error_code,
             claims=resolved,
+            raw_claim_ids=sorted(group_ids),
             edges=group_edges,
         ))
 
-    resolved_df = _rows_to_df(resolved_rows)
-    group_df = _rows_to_df(group_rows)
+    resolved_df = _rows_to_df(resolved_rows, list(ResolvedClaimRow.__dataclass_fields__.keys()))
+    group_df = _rows_to_df(group_rows, list(ResolutionGroupRow.__dataclass_fields__.keys()))
 
     output_dir.mkdir(parents=True, exist_ok=True)
     resolved_df.to_parquet(output_dir / "resolved_claims.parquet", index=False)
@@ -269,8 +295,8 @@ def _resolve_group_rows(
     reason_map: Dict[str, str] = {}
     suppressed_by: Dict[str, Optional[str]] = {}
 
-    if group_status == GROUP_STATUS_SKIP:
-        if chain_order:
+    if group_status in {GROUP_STATUS_SKIP_SINGLETON, GROUP_STATUS_SKIP_NO_EDGES}:
+        if chain_order and group_status == GROUP_STATUS_SKIP_SINGLETON:
             status_map[chain_order[0]] = "applies"
             reason_map[chain_order[0]] = "single_claim"
     elif group_status == GROUP_STATUS_ERROR:
@@ -346,9 +372,9 @@ def _status_counts(rows: List[ResolvedClaimRow]) -> Dict[str, int]:
     return counts
 
 
-def _rows_to_df(rows: List[object]) -> pd.DataFrame:
+def _rows_to_df(rows: List[object], columns: Optional[List[str]] = None) -> pd.DataFrame:
     if not rows:
-        return pd.DataFrame()
+        return pd.DataFrame(columns=columns or [])
     return pd.DataFrame([asdict(row) for row in rows])
 
 
@@ -359,6 +385,7 @@ def _write_trace(
     group_status: str,
     error_code: Optional[str],
     claims: List[ResolvedClaimRow],
+    raw_claim_ids: Optional[List[str]],
     edges: Dict[str, List[Tuple[str, str, Optional[int]]]],
 ) -> Dict[str, object]:
     trace_dir = output_dir / "resolution_traces"
@@ -370,6 +397,7 @@ def _write_trace(
         "error_code": error_code,
         "claims": [row.to_dict() for row in claims],
         "edges": edges,
+        "raw_claim_ids": raw_claim_ids or [],
     }
     name_seed = f"{scope_id}|{group_key}"
     digest = sha256(name_seed.encode("utf-8")).hexdigest()[:12]
@@ -395,17 +423,27 @@ def _write_metadata(
     resolved_df: pd.DataFrame,
     group_df: pd.DataFrame,
 ) -> None:
+    metadata_path = output_dir / "resolution_run_metadata.json"
+    previous = {}
+    if metadata_path.exists():
+        with open(metadata_path, "r", encoding="utf-8") as fh:
+            previous = json.load(fh)
     input_hash = _hash_dataframe(claims_df) + _hash_dataframe(precedence_df)
     output_hash = _hash_dataframe(resolved_df) + _hash_dataframe(group_df)
+    trace_hash = _hash_traces(output_dir / "resolution_traces")
     payload = {
         "input_hash": input_hash,
         "output_hash": output_hash,
+        "trace_hash": trace_hash,
         "claims_rows": int(len(claims_df)),
         "precedence_rows": int(len(precedence_df)),
         "resolved_rows": int(len(resolved_df)),
         "group_rows": int(len(group_df)),
+        "previous_input_hash": previous.get("input_hash"),
+        "previous_output_hash": previous.get("output_hash"),
+        "previous_trace_hash": previous.get("trace_hash"),
     }
-    with open(output_dir / "resolution_run_metadata.json", "w", encoding="utf-8") as fh:
+    with open(metadata_path, "w", encoding="utf-8") as fh:
         json.dump(payload, fh, indent=2, sort_keys=True)
 
 
@@ -434,6 +472,18 @@ def _normalize_cell(value: object) -> str:
     if pd.isna(value):
         return ""
     return str(value)
+
+
+def _hash_traces(trace_dir: Path) -> str:
+    if not trace_dir.exists():
+        return ""
+    digests: List[str] = []
+    for path in sorted(trace_dir.glob("*.json")):
+        with open(path, "r", encoding="utf-8") as fh:
+            payload = json.load(fh)
+        digest = sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+        digests.append(digest)
+    return sha256("".join(digests).encode("utf-8")).hexdigest()
 
 
 __all__ = ["resolve_claims"]

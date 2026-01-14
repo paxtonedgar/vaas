@@ -11,7 +11,7 @@ This project builds a graph-based RAG system for IRS tax documents (1099-DIV and
 - Fine-tuned embeddings via contrastive learning on graph-derived training pairs
 - Hybrid retrieval (BM25 + dense vector + cross-encoder reranking + graph expansion)
 
-**Current Status:** Documentation phase complete. Implementation in progress via Databricks notebooks.
+**Current Status:** Documentation phase complete. Implementation now advancing through the CLI pipeline (`run_pipeline_v2.py`), replacing the original notebook workflow.
 
 **Epic References:** UTILITIESPLATFORM-5327, UTILITIESPLATFORM-5326
 
@@ -34,12 +34,13 @@ PDF → Extraction → Knowledge Graph → Training Pairs → Fine-tuned Embeddi
                    Retrieval (hybrid + graph expansion)
 ```
 
-**Extraction Pipeline (10 cells in Databricks):**
+**Extraction Pipeline Stages (mirrors former notebook cells):**
 - Cell 1-2: PDF → spans with font/position metadata → body size inference
 - Cell 3-4: Spans → elements with role classification → anchor detection (boxes/sections)
 - Cell 5-7: Anchor timeline → content assignment → section assembly
 - Cell 8-9: Reference extraction (regex + LLM) → cross-reference edges
 - Cell 10: Emit to Delta tables (`graph_nodes`, `graph_edges`, `box_registry`)
+- Cell 11: Semantic claims → precedence → resolution outputs (`resolved_claims`, `resolution_groups`, `compiled_directives`, `constraints_resolved`)
 
 **Knowledge Graph Schema:**
 - **Nodes:** Chunks at various granularities (anchor, paragraph, sentence) with canonical IDs
@@ -59,24 +60,33 @@ PDF → Extraction → Knowledge Graph → Training Pairs → Fine-tuned Embeddi
 
 ## Infrastructure & Environment
 
-**Platform:** Databricks notebooks + Delta Lake
-**Storage:** Unity Catalog (`112557_prefetch_ctg_prd_exp.112557_prefetch_raw`)
-**Vector Store:** Databricks Vector Search
-**LLM:** Amazon Bedrock (Claude 3.5 Sonnet) for extraction, validation, pair generation
+**Platform:** Local Python 3.10 CLI (`run_pipeline_v2.py`) with git-tracked modules. Databricks remains the target runtime once pipeline parity is achieved.
+**Storage:** Local `data/` directory for PDFs and `output/` / `output_v2/` for generated parquet/csv artifacts. Copy results to Unity Catalog volumes when syncing with Databricks.
+**Vector Store:** Databricks Vector Search (planned deployment target)
+**LLM:** Amazon Bedrock (Claude 3.5 Sonnet) for extraction assists, validation, pair generation
 
-**File Locations:**
+**Local File Locations:**
 ```
-/Volumes/112557_prefetch_ctg_prd_exp/112557_prefetch_raw/irs_raw/
+data/
 ├── i1099div.pdf          # Filer instructions (primary target)
 ├── f1099div.pdf          # Form PDF
-└── [other forms]
+└── ...
 
-Delta Tables:
-catalog.schema.box_registry      # Box metadata + canonical IDs
-catalog.schema.graph_nodes       # KG nodes
-catalog.schema.graph_edges       # KG edges
-catalog.schema.training_pairs    # Generated training pairs
-catalog.schema.eval_queries      # Evaluation queries
+output/                   # graph_nodes.parquet, graph_edges.parquet, resolved_claims.parquet, compiled_directives.parquet, quality reports
+output_v2/                # experimental runs
+```
+
+**Databricks Volume (when exporting artifacts):**
+```
+/Volumes/112557_prefetch_ctg_prd_exp/112557_prefetch_raw/irs_raw/
+└── [IRS PDFs + derived tables]
+
+Unity Catalog Tables:
+catalog.schema.box_registry
+catalog.schema.graph_nodes
+catalog.schema.graph_edges
+catalog.schema.training_pairs
+catalog.schema.eval_queries
 ```
 
 ## Key Schemas
@@ -257,7 +267,23 @@ IRC_REF_RX = re.compile(r"[Ss]ection\s+(\d+[A-Za-z]?(?:\([a-z]\))?)")
 
 ## Documentation Structure
 
-All design docs are in repository root:
+### Semantic Architecture (Primary - in `docs/`)
+
+Start here for understanding the meta-model:
+
+- **[docs/INDEX.md](docs/INDEX.md)**: Navigation index for all documentation
+- **[docs/SEMANTIC_CORE.md](docs/SEMANTIC_CORE.md)**: **12 Primitives** - The minimal semantic core from which all tax reporting logic composes
+- **[docs/TAX_METAMODEL_DESIGN.md](docs/TAX_METAMODEL_DESIGN.md)**: Integration architecture - how primitives map to graph schema, atoms, bindings
+- **[docs/Form_1099DIV_Ontology.md](docs/Form_1099DIV_Ontology.md)**: 1099-DIV semantic model - entities, rules, relationships
+
+### Key Design Principles
+
+1. **IRS concepts are instances, not types** - "Qualified Dividend" is a Qualification instance, not a Classification enum
+2. **Semantic Atoms prevent diffusion** - "61-day holding" defined once, referenced everywhere
+3. **Form bindings decouple semantics** - `ordinary_dividends_total` binds to "1099-DIV:Box 1a"
+4. **Exclusions are explicit** - Dividend ⊕ Interest is asserted, not just avoided by precedence
+
+### Legacy Docs (in repository root)
 
 - **tax_rag_technical_overview.md**: Problem statement, solution architecture, high-level design
 - **tax_embedding_technical_overview.md**: Deep dive on contrastive learning and graph-based pair generation
@@ -266,17 +292,17 @@ All design docs are in repository root:
 - **tax_embedding_implementation_plan.md**: 10-phase implementation plan with function specs
 - **tax_rag_living_strategy.md**: Risk analysis, LLM provenance principles, dialectical challenges
 
-When implementing features, cross-reference these docs for context.
+When implementing features, start with the semantic architecture docs, then cross-reference legacy docs for context.
 
 ## Development Workflow
 
-### Notebook-Based Development
+### CLI-Based Development
 
-Primary development happens in Jupyter notebooks that are Databricks-compatible. The workflow:
+Primary development now happens in standard Python modules plus the orchestration script. The workflow:
 
-1. **Local Development**: Edit notebooks in `notebooks/` directory using JupyterLab
-2. **Git Sync**: Push to git repository
-3. **Databricks Deploy**: Copy/paste notebook cells into Databricks workspace
+1. **Local Development**: Edit modules under `src/vaas/`, keep tests in `tests/`, and expose new knobs through `PipelineConfig` inside `run_pipeline_v2.py`.
+2. **Validation**: Run `python -m vaas.run_pipeline_v2 --pdf data/i1099div.pdf --output output --validate` to regenerate outputs and reports.
+3. **Graph Checks**: Inspect `output/graph_quality_report.md` / `.json` and run `python validate_graph.py` before sharing artifacts or syncing with Databricks.
 
 ### Local Setup
 
@@ -285,73 +311,43 @@ Primary development happens in Jupyter notebooks that are Databricks-compatible.
 python -m venv .venv
 source .venv/bin/activate
 
-# Install package with dev dependencies
-pip install -e ".[dev]"
+# Install dependencies + tooling
+make install-dev
 
 # Place PDFs in data/ directory
 mkdir -p data
 # Copy i1099div.pdf, f1099div.pdf to data/
-
-# Start JupyterLab
-jupyter lab notebooks/
 ```
 
 ### Project Structure
 
 ```
 vaas/
-├── src/vaas/              # Shared Python modules (importable in notebooks)
-│   ├── extraction/        # PDF extraction (Cells 1-4)
-│   │   ├── pdf_extraction.py
-│   │   └── element_construction.py
-│   └── utils/             # Constants, regexes, common functions
-│       ├── constants.py
-│       ├── regexes.py
-│       └── common.py
-├── notebooks/             # Jupyter notebooks (mirror Databricks cells)
-│   └── 01_pdf_extraction_pipeline.ipynb
-├── data/                  # Local PDF files (gitignored)
-├── requirements.txt
-└── setup.py
+├── run_pipeline_v2.py     # CLI orchestrator (replaces notebooks)
+├── validate_graph.py      # Consistency checker for emitted graph
+├── src/vaas/
+│   ├── extraction/        # PDF parsing, layout, anchors, sections
+│   ├── semantic/          # Regime detection, concept roles
+│   ├── graph/             # Node/edge builders
+│   ├── core/              # Primitives, atoms, bindings
+│   └── utils/             # Constants, regexes, shared helpers
+├── tests/                 # Pytest suites mirroring src layout
+├── docs/                  # Architectural references
+├── output/, output_v2/    # Generated artifacts (gitignored)
+├── AGENTS.md, README.md   # Contributor docs
+└── requirements.txt       # Runtime dependencies
 ```
-
-### Path Configuration
-
-Notebooks detect environment and set paths accordingly:
-
-```python
-# Local development
-BASE = Path("../data")
-INSTRUCTIONS_PATH = BASE / "i1099div.pdf"
-
-# Databricks (copy/paste and modify)
-BASE = Path("/Volumes/112557_prefetch_ctg_prd_exp/112557_prefetch_raw/irs_raw/")
-INSTRUCTIONS_PATH = BASE / "i1099div.pdf"
-```
-
-### Module Usage
-
-Shared code lives in `src/vaas/` and is imported in notebooks:
-
-```python
-# Local: add src to path
-sys.path.insert(0, str(Path.cwd().parent / "src"))
-
-# Then import normally
-from vaas.extraction.pdf_extraction import cell1_extract_spans
-from vaas.utils.regexes import BOX_RX_SINGLE
-```
-
-For Databricks: either copy module code into notebook cells, or install wheel on cluster.
 
 ### Common Tasks
 
 ```bash
-make install-dev    # Install with all dependencies
-make notebook       # Start JupyterLab
-make test           # Run tests
-make format         # Format with black
-make lint           # Run flake8
+make install-dev    # Install runtime + tooling dependencies
+make pipeline       # Run run_pipeline_v2.py with default arguments
+make test           # Run pytest
+make lint           # flake8 (100-char lines, ignore W503)
+make format         # black across src/, tests/, run_pipeline_v2.py, validate_graph.py
+make typecheck      # mypy src/
+make clean          # Remove build artifacts and caches
 ```
 
 ## Git Status Note

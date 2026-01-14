@@ -19,8 +19,6 @@ from .edges import (
     build_typed_edges,
     # Orchestrator
     build_all_edges,
-    # Legacy compatibility
-    build_edges_legacy,
 )
 
 from .nodes import (
@@ -48,8 +46,6 @@ from .nodes import (
     build_paragraph_nodes,
     # Orchestrator
     build_all_nodes,
-    # Legacy compatibility
-    build_nodes_legacy,
 )
 
 __all__ = [
@@ -71,8 +67,6 @@ __all__ = [
     "build_typed_edges",
     # Edge orchestrator
     "build_all_edges",
-    # Edge legacy compatibility
-    "build_edges_legacy",
     # Node data structures
     "Node",
     "NodeBuildResult",
@@ -97,6 +91,4 @@ __all__ = [
     "build_paragraph_nodes",
     # Node orchestrator
     "build_all_nodes",
-    # Node legacy compatibility
-    "build_nodes_legacy",
 ]

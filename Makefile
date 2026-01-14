@@ -1,14 +1,14 @@
 # VaaS Development Makefile
 
-.PHONY: install install-dev test lint format typecheck clean notebook export-databricks build-wheel help
+.PHONY: install install-dev test lint format typecheck clean pipeline help
 
 # Default target
 help:
 	@echo "VaaS Development Commands"
 	@echo ""
 	@echo "Setup:"
-	@echo "  make install      Install package in development mode"
-	@echo "  make install-dev  Install with all dev dependencies"
+	@echo "  make install      Install runtime dependencies"
+	@echo "  make install-dev  Install runtime + tooling dependencies"
 	@echo ""
 	@echo "Development:"
 	@echo "  make test         Run tests"
@@ -16,12 +16,8 @@ help:
 	@echo "  make format       Format code (black)"
 	@echo "  make typecheck    Run type checking (mypy)"
 	@echo ""
-	@echo "Notebooks:"
-	@echo "  make notebook     Start Jupyter Lab"
-	@echo ""
-	@echo "Databricks:"
-	@echo "  make export-databricks  Export notebooks for Databricks"
-	@echo "  make build-wheel        Build wheel for Databricks cluster"
+	@echo "Pipeline:"
+	@echo "  make pipeline     Run python -m vaas.run_pipeline_v2 with default inputs"
 	@echo ""
 	@echo "Cleanup:"
 	@echo "  make clean        Remove build artifacts"
@@ -31,7 +27,7 @@ install:
 	pip install -e .
 
 install-dev:
-	pip install -e ".[dev,databricks]"
+	pip install -e .[dev]
 	python -m spacy download en_core_web_sm || true
 
 # Testing and Quality
@@ -42,25 +38,14 @@ lint:
 	flake8 src/ --max-line-length=100 --ignore=E501,W503
 
 format:
-	black src/ notebooks/ scripts/
+	black src/ tests/
 
 typecheck:
 	mypy src/ --ignore-missing-imports
 
-# Notebooks
-notebook:
-	jupyter lab notebooks/
-
-# Databricks Export
-export-databricks:
-	python scripts/export_to_databricks.py --all
-	@echo ""
-	@echo "Notebooks exported to output/databricks/"
-
-build-wheel:
-	python scripts/export_to_databricks.py --build-wheel
-	@echo ""
-	@echo "Wheel built in dist/"
+# Pipeline Runner
+pipeline:
+	python -m vaas.run_pipeline_v2 --pdf data/i1099div.pdf --output output --validate
 
 # Cleanup
 clean:

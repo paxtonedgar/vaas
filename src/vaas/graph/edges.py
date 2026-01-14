@@ -27,6 +27,7 @@ import pandas as pd
 
 from vaas.extraction.geometry import reading_order_sort_key
 from vaas.utils.text import stable_hash
+from vaas.utils.term_bindings import exception_term_from_context
 
 
 logger = logging.getLogger(__name__)
@@ -35,6 +36,51 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 # DATA STRUCTURES
 # =============================================================================
+
+# =============================================================================
+# RULE CLASS CONSTANTS (for semantic precedence)
+# =============================================================================
+# Lower = higher priority. Rule class determines base precedence.
+# Tie-breaker within class uses reading order.
+
+RULE_CLASS_GATING = "GATING"          # "Only X should complete..." - base 100
+RULE_CLASS_PROHIBITION = "PROHIBITION"  # "Do not include..." - base 200
+RULE_CLASS_FALLBACK = "FALLBACK"      # "If impractical..." - base 300
+RULE_CLASS_POPULATION = "POPULATION"  # "Enter/Include X in box Y" - base 1000
+RULE_CLASS_AGGREGATION = "AGGREGATION"  # "Box A includes box B" - base 1100
+
+RULE_CLASS_BASE_PRECEDENCE = {
+    RULE_CLASS_GATING: 1,       # "Only X should complete..." - highest priority
+    RULE_CLASS_PROHIBITION: 2,  # "Do not include..."
+    RULE_CLASS_FALLBACK: 3,     # "If impractical..."
+    RULE_CLASS_POPULATION: 10,  # "Enter/Include X in box Y"
+    RULE_CLASS_AGGREGATION: 11, # "Box A includes box B"
+    None: 20,                   # Unclassified edges
+}
+
+# Scale factor to ensure rule_class completely dominates position
+RULE_CLASS_SCALE = 1_000_000_000
+
+
+def compute_precedence(rule_class: Optional[str], reading_order: int, sentence_idx: int) -> int:
+    """
+    Compute precedence from rule class and position.
+
+    Formula: base(rule_class) * 1_000_000_000 + reading_order * 1000 + sentence_idx
+    Rule class completely dominates; position is only a tie-breaker within class.
+
+    Args:
+        rule_class: Rule classification (GATING, PROHIBITION, etc.)
+        reading_order: Document reading order (0-based)
+        sentence_idx: Sentence index within section (0-based)
+
+    Returns:
+        Precedence value (lower = higher priority)
+    """
+    base = RULE_CLASS_BASE_PRECEDENCE.get(rule_class, 20)
+    # Position is pure tie-breaker within same rule class
+    return base * RULE_CLASS_SCALE + reading_order * 1000 + sentence_idx
+
 
 @dataclass
 class Edge:
@@ -50,12 +96,20 @@ class Edge:
         confidence: Confidence score (0.0-1.0).
         source_evidence: Evidence text supporting this edge.
         source_element_id: Element ID containing evidence (for provenance).
+        source_element_ids: List of element IDs for multi-source edges (provenance).
+        source_pages: Page numbers where evidence appears (provenance).
+        source_bbox: Bounding box of evidence [x0, y0, x1, y1] (provenance).
         created_by: How edge was created ("structural", "regex", "llm").
         pattern_matched: For typed edges, the pattern that matched.
         polarity: For typed edges, "positive" or "negative".
         evidence_sentence_idx: Sentence index within section (for sentence-gated edges).
         evidence_char_start: Character offset start (relative to section full_text).
         evidence_char_end: Character offset end (relative to section full_text).
+        rule_class: Semantic rule classification (GATING, PROHIBITION, FALLBACK, etc.).
+            Determines base precedence. None for structural/reference edges.
+        precedence: Rule priority (lower = higher priority). First-match-wins semantics.
+            Computed as: base(rule_class) + tie_breaker(reading_order, sentence_idx)
+            None means no precedence context (structural edges).
     """
 
     edge_id: str
@@ -66,6 +120,9 @@ class Edge:
     confidence: float = 1.0
     source_evidence: Optional[str] = None
     source_element_id: Optional[str] = None
+    source_element_ids: List[str] = field(default_factory=list)
+    source_pages: List[int] = field(default_factory=list)
+    source_bbox: Optional[List[float]] = None
     created_by: str = "structural"
     pattern_matched: Optional[str] = None
     polarity: Optional[str] = None
@@ -73,6 +130,9 @@ class Edge:
     evidence_sentence_idx: Optional[int] = None
     evidence_char_start: Optional[int] = None
     evidence_char_end: Optional[int] = None
+    # Rule classification and precedence (semantic priority)
+    rule_class: Optional[str] = None
+    precedence: Optional[int] = None
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for DataFrame construction."""
@@ -85,12 +145,17 @@ class Edge:
             "confidence": self.confidence,
             "source_evidence": self.source_evidence,
             "source_element_id": self.source_element_id,
+            "source_element_ids": self.source_element_ids,
+            "source_pages": self.source_pages,
+            "source_bbox": self.source_bbox,
             "created_by": self.created_by,
             "pattern_matched": self.pattern_matched,
             "polarity": self.polarity,
             "evidence_sentence_idx": self.evidence_sentence_idx,
             "evidence_char_start": self.evidence_char_start,
             "evidence_char_end": self.evidence_char_end,
+            "rule_class": self.rule_class,
+            "precedence": self.precedence,
         }
 
 
@@ -103,11 +168,13 @@ class EdgeBuildResult:
         edges_df: DataFrame with all edges.
         edge_counts: Dictionary of edge type to count.
         edges_filtered: Number of edges filtered (referencing non-existent nodes).
+        typed_edges: List of typed semantic Edge objects (pre-dedup).
     """
 
     edges_df: pd.DataFrame
     edge_counts: Dict[str, int] = field(default_factory=dict)
     edges_filtered: int = 0
+    typed_edges: List[Edge] = field(default_factory=list)
 
     @property
     def total(self) -> int:
@@ -327,6 +394,10 @@ def build_anchor_paragraph_edges(
     """
     Build parent_of edges from anchors to paragraphs.
 
+    Guarantees: Every paragraph gets a parent_of edge.
+    - If anchor_id is valid, use it
+    - If anchor_id is missing or invalid, fall back to doc_root
+
     Args:
         paragraph_nodes_df: Paragraph nodes DataFrame.
         doc_id: Document ID prefix.
@@ -339,32 +410,46 @@ def build_anchor_paragraph_edges(
         return []
 
     edges: List[Edge] = []
+    doc_root_id = f"{doc_id}:doc_root"
+    orphan_count = 0
 
     for _, para in paragraph_nodes_df.iterrows():
         para_node_id = para["node_id"]
         anchor_id = para.get("anchor_id")
         element_id = para.get("element_id")
 
-        if not anchor_id:
-            continue
-
-        anchor_node_id = f"{doc_id}:{anchor_id}"
-
-        # Verify anchor exists
-        if anchor_node_id not in valid_anchor_node_ids:
-            continue
+        # Determine parent - fall back to doc_root if anchor invalid
+        if anchor_id:
+            anchor_node_id = f"{doc_id}:{anchor_id}"
+            if anchor_node_id in valid_anchor_node_ids:
+                parent_node_id = anchor_node_id
+                evidence = f"Paragraph under {anchor_id}"
+            else:
+                # Anchor doesn't exist - orphan recovery
+                parent_node_id = doc_root_id
+                evidence = f"Orphan paragraph (missing anchor: {anchor_id})"
+                orphan_count += 1
+                logger.warning(f"Orphan paragraph {para_node_id}: anchor {anchor_id} not found")
+        else:
+            # No anchor_id at all - attach to doc_root
+            parent_node_id = doc_root_id
+            evidence = "Paragraph with no anchor_id"
+            orphan_count += 1
 
         edges.append(Edge(
-            edge_id=generate_edge_id("parent_of", anchor_node_id, para_node_id),
-            source_node_id=anchor_node_id,
+            edge_id=generate_edge_id("parent_of", parent_node_id, para_node_id),
+            source_node_id=parent_node_id,
             target_node_id=para_node_id,
             edge_type="parent_of",
             direction="directed",
-            confidence=1.0,
-            source_evidence=f"Paragraph under {anchor_id}",
+            confidence=1.0 if parent_node_id != doc_root_id else 0.5,  # Lower confidence for orphan recovery
+            source_evidence=evidence,
             source_element_id=str(element_id) if element_id else None,
             created_by="structural",
         ))
+
+    if orphan_count > 0:
+        logger.info(f"Recovered {orphan_count} orphan paragraphs (attached to doc_root)")
 
     logger.debug(f"Built {len(edges)} anchor→paragraph edges")
     return edges
@@ -494,18 +579,21 @@ def build_box_reference_edges(
     """
     Build references_box edges from extracted references.
 
+    Deduplicates by (source_node_id, target_node_id) - only one edge per pair.
+
     Args:
         references_df: References DataFrame with source_anchor_id, target_anchor_id.
         valid_node_ids: Set of valid node IDs to filter against.
         doc_id: Document ID prefix.
 
     Returns:
-        List of references_box Edge objects.
+        List of references_box Edge objects (deduplicated).
     """
     if references_df.empty:
         return []
 
     edges: List[Edge] = []
+    seen_pairs: Set[Tuple[str, str]] = set()  # (source, target) pairs
 
     for _, ref in references_df.iterrows():
         # Only process internal box references
@@ -529,6 +617,28 @@ def build_box_reference_edges(
         if target_node_id not in valid_node_ids:
             continue
 
+        # Dedupe by (source, target) pair
+        pair = (source_node_id, target_node_id)
+        if pair in seen_pairs:
+            continue
+        seen_pairs.add(pair)
+
+        # Extract provenance fields
+        source_page = ref.get("page")
+        source_pages = [int(source_page)] if source_page is not None and not pd.isna(source_page) else []
+
+        source_bbox = None
+        if "geom_x0" in ref.index:
+            try:
+                source_bbox = [
+                    float(ref["geom_x0"]),
+                    float(ref["geom_y0"]),
+                    float(ref["geom_x1"]),
+                    float(ref["geom_y1"]),
+                ]
+            except (ValueError, TypeError, KeyError):
+                pass
+
         edges.append(Edge(
             edge_id=generate_edge_id("references_box", source_node_id, target_node_id),
             source_node_id=source_node_id,
@@ -538,10 +648,12 @@ def build_box_reference_edges(
             confidence=float(ref.get("confidence", 0.9)),
             source_evidence=ref.get("evidence_text") or ref.get("ref_text", ""),
             source_element_id=str(ref.get("source_element_id")) if ref.get("source_element_id") else None,
+            source_pages=source_pages,
+            source_bbox=source_bbox,
             created_by=ref.get("created_by", "regex"),
         ))
 
-    logger.debug(f"Built {len(edges)} box reference edges")
+    logger.debug(f"Built {len(edges)} box reference edges (deduped from {len(references_df)} refs)")
     return edges
 
 
@@ -612,6 +724,8 @@ def _build_paragraph_semantic_edges(
     paragraph_nodes_df: pd.DataFrame,
     valid_box_keys: Set[str],
     doc_id: str,
+    form_id: Optional[str],
+    anchor_context: Optional[Dict[str, Dict[str, str]]] = None,
 ) -> Tuple[List[Edge], Dict[str, int]]:
     """
     Build concept→box semantic edges from paragraphs.
@@ -640,9 +754,26 @@ def _build_paragraph_semantic_edges(
         para_node_id = para.get("node_id", "")
         para_text = para.get("text", "") or ""
         parent_box_key = (para.get("box_key", "") or "").lower() or None
+        anchor_id = para.get("anchor_id")
+        anchor_key = str(anchor_id) if anchor_id else ""
+        context = anchor_context.get(anchor_key, {}) if anchor_context else {}
+        exception_term = (
+            exception_term_from_context(context.get("label"))
+            or exception_term_from_context(context.get("full_text"))
+        )
+        paragraph_kind = str(para.get("paragraph_kind") or "")
+        if paragraph_kind != "list":
+            exception_term = None
 
         if not para_text.strip() or not para_node_id:
             continue
+
+        # Get reading_order for precedence computation
+        reading_order = para.get("reading_order")
+        if reading_order is None or pd.isna(reading_order):
+            reading_order = 0
+        else:
+            reading_order = int(reading_order)
 
         # Extract using clean public API (full node_id, no reconstruction)
         candidates = extract_concept_to_box_edges(
@@ -650,6 +781,8 @@ def _build_paragraph_semantic_edges(
             text=para_text,
             valid_box_keys=valid_box_keys,
             parent_box_key=parent_box_key,
+            form_id=form_id,
+            exception_term=exception_term,
         )
 
         if candidates:
@@ -660,6 +793,11 @@ def _build_paragraph_semantic_edges(
 
             # Count by type
             stats["edges_by_type"][te.edge_type] = stats["edges_by_type"].get(te.edge_type, 0) + 1
+
+            # Compute precedence using rule_class + position tie-breaker
+            # Rule class completely dominates; position only breaks ties within class
+            sentence_idx = te.sentence_idx if te.sentence_idx is not None else 0
+            precedence = compute_precedence(te.rule_class, reading_order, sentence_idx)
 
             edges.append(Edge(
                 edge_id=generate_edge_id(te.edge_type, para_node_id, target_node_id),
@@ -676,6 +814,8 @@ def _build_paragraph_semantic_edges(
                 evidence_sentence_idx=te.sentence_idx,
                 evidence_char_start=te.sentence_char_start,
                 evidence_char_end=te.sentence_char_end,
+                rule_class=te.rule_class,
+                precedence=precedence,
             ))
 
     return edges, stats
@@ -690,7 +830,7 @@ def _build_box_dependency_edges(
     Build box→box dependency edges from box sections.
 
     These describe relationships between boxes.
-    Edges: requires, includes
+    Edges: aggregates, requires, includes
 
     Returns:
         Tuple of (edges list, stats dict)
@@ -705,6 +845,15 @@ def _build_box_dependency_edges(
 
     if sections_df is None or sections_df.empty:
         return edges, stats
+
+    # Build section order for precedence (based on reading order)
+    box_sections = sections_df[sections_df["anchor_type"] == "box"].copy()
+    if not box_sections.empty:
+        box_sections["_sort_key"] = box_sections.apply(get_sort_key_for_section, axis=1)
+        box_sections = box_sections.sort_values("_sort_key").reset_index(drop=True)
+        section_order = {row["anchor_id"]: idx for idx, row in box_sections.iterrows()}
+    else:
+        section_order = {}
 
     for _, section in sections_df.iterrows():
         anchor_type = section.get("anchor_type", "")
@@ -739,6 +888,11 @@ def _build_box_dependency_edges(
 
             stats["edges_by_type"][te.edge_type] = stats["edges_by_type"].get(te.edge_type, 0) + 1
 
+            # Compute precedence using rule_class + section order as tie-breaker
+            sentence_idx = te.sentence_idx if te.sentence_idx is not None else 0
+            section_idx = section_order.get(anchor_id, 0)
+            precedence = compute_precedence(te.rule_class, section_idx, sentence_idx)
+
             edges.append(Edge(
                 edge_id=generate_edge_id(te.edge_type, source_node_id, target_node_id),
                 source_node_id=source_node_id,
@@ -754,6 +908,94 @@ def _build_box_dependency_edges(
                 evidence_sentence_idx=te.sentence_idx,
                 evidence_char_start=te.sentence_char_start,
                 evidence_char_end=te.sentence_char_end,
+                rule_class=te.rule_class,
+                precedence=precedence,
+            ))
+
+    return edges, stats
+
+
+def _build_anchor_semantic_edges(
+    sections_df: pd.DataFrame,
+    valid_box_keys: Set[str],
+    doc_id: str,
+    form_id: Optional[str],
+) -> Tuple[List[Edge], Dict[str, int]]:
+    """
+    Build concept→box semantic edges from anchor sections with single-source text.
+
+    This captures definition-style anchors that have a single backing element,
+    allowing sentence offsets to align with element-level evidence.
+    """
+    from vaas.semantic.typed_edges import extract_concept_to_box_edges
+
+    edges: List[Edge] = []
+    stats = {
+        "anchors_scanned": 0,
+        "anchors_with_edges": 0,
+        "edges_by_type": {},
+    }
+
+    if sections_df is None or sections_df.empty:
+        return edges, stats
+
+    sections_sorted = sections_df.copy()
+    sections_sorted["_sort_key"] = sections_sorted.apply(get_sort_key_for_section, axis=1)
+    sections_sorted = sections_sorted.sort_values("_sort_key").reset_index(drop=True)
+    section_order = {row["anchor_id"]: idx for idx, row in sections_sorted.iterrows()}
+
+    for _, section in sections_df.iterrows():
+        anchor_type = section.get("anchor_type", "")
+        if anchor_type == "box":
+            continue
+        if (section.get("concept_role") or "") != "definition":
+            continue
+
+        element_ids = section.get("element_ids") or []
+        if not isinstance(element_ids, (list, tuple)) or len(element_ids) != 1:
+            continue
+
+        full_text = section.get("full_text", "") or ""
+        if not full_text.strip():
+            continue
+
+        stats["anchors_scanned"] += 1
+        anchor_id = section.get("anchor_id")
+        source_node_id = f"{doc_id}:{anchor_id}"
+        candidates = extract_concept_to_box_edges(
+            source_node_id=source_node_id,
+            text=full_text,
+            valid_box_keys=valid_box_keys,
+            form_id=form_id,
+        )
+
+        if candidates:
+            stats["anchors_with_edges"] += 1
+
+        for te in candidates:
+            target_node_id = f"{doc_id}:box_{te.target_box_key}"
+            stats["edges_by_type"][te.edge_type] = stats["edges_by_type"].get(te.edge_type, 0) + 1
+            sentence_idx = te.sentence_idx if te.sentence_idx is not None else 0
+            section_idx = section_order.get(anchor_id, 0)
+            precedence = compute_precedence(te.rule_class, section_idx, sentence_idx)
+
+            edges.append(Edge(
+                edge_id=generate_edge_id(te.edge_type, source_node_id, target_node_id),
+                source_node_id=source_node_id,
+                target_node_id=target_node_id,
+                edge_type=te.edge_type,
+                direction="directed",
+                confidence=te.confidence,
+                source_evidence=te.evidence_text,
+                source_element_id=str(element_ids[0]),
+                created_by="regex",
+                pattern_matched=te.pattern_matched,
+                polarity=te.polarity,
+                evidence_sentence_idx=te.sentence_idx,
+                evidence_char_start=te.sentence_char_start,
+                evidence_char_end=te.sentence_char_end,
+                rule_class=te.rule_class,
+                precedence=precedence,
             ))
 
     return edges, stats
@@ -761,17 +1003,24 @@ def _build_box_dependency_edges(
 
 def _dedupe_edges(edges: List[Edge]) -> List[Edge]:
     """
-    Dedupe edges by (edge_type, source_node_id, target_node_id).
+    Dedupe edges by (edge_type, source_node_id, target_node_id, sentence, span).
 
-    Keeps the highest-confidence edge for each unique triple.
+    Keeps the highest-confidence edge for each unique key.
     """
     if not edges:
         return []
 
     # Group by key, keep highest confidence
-    best: Dict[Tuple[str, str, str], Edge] = {}
+    best: Dict[Tuple[str, str, str, Optional[int], Optional[int], Optional[int]], Edge] = {}
     for e in edges:
-        key = (e.edge_type, e.source_node_id, e.target_node_id)
+        key = (
+            e.edge_type,
+            e.source_node_id,
+            e.target_node_id,
+            e.evidence_sentence_idx,
+            e.evidence_char_start,
+            e.evidence_char_end,
+        )
         if key not in best or e.confidence > best[key].confidence:
             best[key] = e
 
@@ -783,7 +1032,8 @@ def build_typed_edges(
     anchors_df: pd.DataFrame,
     doc_id: str,
     paragraph_nodes_df: Optional[pd.DataFrame] = None,
-) -> List[Edge]:
+    form_id: Optional[str] = None,
+) -> Tuple[List[Edge], Dict[str, int]]:
     """
     Build typed semantic edges (excludes, includes, applies_if, etc.).
 
@@ -811,16 +1061,38 @@ def build_typed_edges(
         if "box_key" in box_anchors.columns:
             valid_box_keys = set(box_anchors["box_key"].str.lower().dropna())
 
-    # Build edges from two sources
+    anchor_context: Dict[str, Dict[str, str]] = {}
+    if not sections_df.empty:
+        for _, row in sections_df.iterrows():
+            anchor_id = row.get("anchor_id")
+            if not anchor_id:
+                continue
+            anchor_context[str(anchor_id)] = {
+                "label": str(row.get("label") or ""),
+                "full_text": str(row.get("full_text") or ""),
+            }
+
+    # Build edges from sources
     para_edges, para_stats = _build_paragraph_semantic_edges(
-        paragraph_nodes_df, valid_box_keys, doc_id
+        paragraph_nodes_df,
+        valid_box_keys,
+        doc_id,
+        form_id,
+        anchor_context=anchor_context,
+    )
+    anchor_edges, anchor_stats = _build_anchor_semantic_edges(
+        sections_df,
+        valid_box_keys,
+        doc_id,
+        form_id,
     )
     box_edges, box_stats = _build_box_dependency_edges(
         sections_df, valid_box_keys, doc_id
     )
 
     # Combine and dedupe
-    all_edges = para_edges + box_edges
+    typed_edges_raw = para_edges + anchor_edges + box_edges
+    all_edges = typed_edges_raw
     before_dedupe = len(all_edges)
     all_edges = _dedupe_edges(all_edges)
     deduped_count = before_dedupe - len(all_edges)
@@ -829,6 +1101,8 @@ def build_typed_edges(
     logger.info(
         f"Typed edges: paragraphs scanned={para_stats['paragraphs_scanned']}, "
         f"with_edges={para_stats['paragraphs_with_edges']}, "
+        f"anchors scanned={anchor_stats['anchors_scanned']}, "
+        f"anchors_with_edges={anchor_stats['anchors_with_edges']}, "
         f"box_sections={box_stats['box_sections_scanned']}"
     )
 
@@ -844,7 +1118,14 @@ def build_typed_edges(
         logger.info(f"Deduped {deduped_count} duplicate edges")
 
     logger.debug(f"Built {len(all_edges)} typed edges total")
-    return all_edges
+    stats_summary = {
+        "paragraphs_scanned": para_stats["paragraphs_scanned"],
+        "paragraphs_with_edges": para_stats["paragraphs_with_edges"],
+        "anchors_scanned": anchor_stats["anchors_scanned"],
+        "anchors_with_edges": anchor_stats["anchors_with_edges"],
+        "box_sections_scanned": box_stats["box_sections_scanned"],
+    }
+    return all_edges, stats_summary
 
 
 # =============================================================================
@@ -859,6 +1140,7 @@ def build_all_edges(
     doc_id: str,
     graph_nodes_df: pd.DataFrame,
     include_typed_edges: bool = True,
+    form_id: Optional[str] = None,
 ) -> EdgeBuildResult:
     """
     Build all edge types and combine.
@@ -926,12 +1208,14 @@ def build_all_edges(
     edge_counts["same_group"] = len(same_group_edges)
 
     # 8. Typed semantic edges (Phase B: paragraph-scoped)
+    typed_edges: List[Edge] = []
     if include_typed_edges:
-        typed_edges = build_typed_edges(
+        typed_edges, typed_stats = build_typed_edges(
             sections_df=sections_df,
             anchors_df=anchors_df,
             doc_id=doc_id,
             paragraph_nodes_df=paragraph_nodes_df,
+            form_id=form_id,
         )
         all_edges.extend(typed_edges)
 
@@ -969,54 +1253,5 @@ def build_all_edges(
         edges_df=edges_df,
         edge_counts=final_counts,
         edges_filtered=edges_filtered,
+        typed_edges=typed_edges,
     )
-
-
-# =============================================================================
-# LEGACY COMPATIBILITY
-# =============================================================================
-
-def build_edges_legacy(
-    sections_df: pd.DataFrame,
-    paragraph_nodes_df: pd.DataFrame,
-    references_df: pd.DataFrame,
-    anchors_df: pd.DataFrame,
-    graph_nodes_df: pd.DataFrame,
-    doc_id: str = "1099div_filer",
-) -> pd.DataFrame:
-    """
-    Legacy-compatible wrapper for build_all_edges.
-
-    Matches original run_pipeline.py behavior for drop-in replacement.
-
-    Args:
-        sections_df: Sections DataFrame.
-        paragraph_nodes_df: Paragraph nodes DataFrame.
-        references_df: References DataFrame.
-        anchors_df: Anchors DataFrame.
-        graph_nodes_df: Graph nodes DataFrame.
-        doc_id: Document ID.
-
-    Returns:
-        Edges DataFrame.
-    """
-    result = build_all_edges(
-        sections_df=sections_df,
-        paragraph_nodes_df=paragraph_nodes_df,
-        references_df=references_df,
-        anchors_df=anchors_df,
-        doc_id=doc_id,
-        graph_nodes_df=graph_nodes_df,
-        include_typed_edges=True,
-    )
-
-    # Print summary (matching original behavior)
-    print(f"\nGraph edges: {len(result.edges_df)}")
-    if result.edges_filtered > 0:
-        print(f"Dropped {result.edges_filtered} edges referencing pruned/missing nodes")
-
-    if not result.edges_df.empty:
-        print(f"\n--- Edge Types ---")
-        print(result.edges_df["edge_type"].value_counts().to_string())
-
-    return result.edges_df

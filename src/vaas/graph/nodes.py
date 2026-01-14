@@ -51,9 +51,10 @@ class Node:
         box_key: Box key for box nodes (e.g., "1a", "2e").
         label: Short display label.
         text: Full text content.
-        pages: List of page numbers.
-        bbox: Bounding box [x0, y0, x1, y1].
-        element_id: Element ID for paragraph nodes.
+        pages: List of page numbers (provenance).
+        bbox: Bounding box union [x0, y0, x1, y1] (provenance).
+        element_id: Element ID for paragraph nodes (singular).
+        element_ids: Element IDs for section nodes (plural, provenance).
         element_count: Number of elements (1 for paragraphs).
         char_count: Character count of text.
         reading_order: Reading order within anchor (for paragraphs).
@@ -72,6 +73,7 @@ class Node:
     pages: List[int] = field(default_factory=list)
     bbox: Optional[List[float]] = None
     element_id: Optional[str] = None
+    element_ids: List[str] = field(default_factory=list)
     element_count: int = 0
     char_count: int = 0
     reading_order: Optional[int] = None
@@ -92,6 +94,7 @@ class Node:
             "pages": self.pages,
             "bbox": self.bbox,
             "element_id": self.element_id,
+            "element_ids": self.element_ids,
             "element_count": self.element_count,
             "char_count": self.char_count,
             "reading_order": self.reading_order,
@@ -267,6 +270,15 @@ def build_section_nodes(
         if bbox is not None and not isinstance(bbox, list):
             bbox = list(bbox) if hasattr(bbox, '__iter__') else None
 
+        # Normalize element_ids to list (provenance)
+        element_ids = section.get("element_ids", [])
+        if element_ids is None:
+            element_ids = []
+        elif not isinstance(element_ids, list):
+            element_ids = list(element_ids) if hasattr(element_ids, '__iter__') else []
+        # Ensure all IDs are strings
+        element_ids = [str(eid) for eid in element_ids]
+
         nodes.append(Node(
             node_id=generate_node_id(doc_id, anchor_id),
             doc_id=doc_id,
@@ -277,6 +289,7 @@ def build_section_nodes(
             text=section.get("full_text", "") or "",
             pages=pages,
             bbox=bbox,
+            element_ids=element_ids,
             element_count=int(section.get("element_count", 0) or 0),
             char_count=int(section.get("char_count", 0) or 0),
             concept_role=concept_role,
@@ -292,6 +305,7 @@ def build_paragraph_nodes(
     sections_df: pd.DataFrame,
     doc_id: str,
     skip_roles: Optional[Set[str]] = None,
+    force_element_ids: Optional[Set[str]] = None,
 ) -> List[Node]:
     """
     Create paragraph-level nodes from elements.
@@ -316,6 +330,7 @@ def build_paragraph_nodes(
 
     if skip_roles is None:
         skip_roles = DEFAULT_SKIP_ROLES
+    force_element_ids = {str(e) for e in (force_element_ids or set())}
 
     # Build anchor_id -> metadata lookup from sections_df
     anchor_meta: Dict[str, Dict[str, str]] = {}
@@ -333,12 +348,15 @@ def build_paragraph_nodes(
     for _, elem in elements_df.iterrows():
         role = elem.get("role", "")
 
-        # Skip artifacts
-        if role in skip_roles:
+        element_id = str(elem["element_id"])
+        force_paragraph = element_id in force_element_ids
+
+        # Skip artifacts unless forced
+        if not force_paragraph and role in skip_roles:
             continue
 
-        # Skip header elements - they're already represented as anchor nodes
-        if role in HEADER_ROLES:
+        # Skip header elements unless forced (references may live inside)
+        if not force_paragraph and role in HEADER_ROLES:
             continue
 
         # Skip empty elements
@@ -350,8 +368,6 @@ def build_paragraph_nodes(
         aid = elem.get("anchor_id")
         if not isinstance(aid, str) or not aid or aid == "unassigned":
             continue
-
-        element_id = str(elem["element_id"])
 
         # Determine paragraph_kind from role
         if role == ROLE_LIST_BLOCK:
@@ -434,6 +450,7 @@ def build_all_nodes(
     doc_id: str,
     doc_label: str = "Document Root",
     skip_roles: Optional[Set[str]] = None,
+    force_element_ids: Optional[Set[str]] = None,
 ) -> NodeBuildResult:
     """
     Build all node types and combine into DataFrame.
@@ -460,7 +477,11 @@ def build_all_nodes(
 
     # 3. Paragraph nodes
     paragraph_nodes = build_paragraph_nodes(
-        elements_df, sections_df, doc_id, skip_roles
+        elements_df,
+        sections_df,
+        doc_id,
+        skip_roles,
+        force_element_ids=force_element_ids,
     )
     all_nodes.extend(paragraph_nodes)
 
@@ -484,51 +505,3 @@ def build_all_nodes(
         section_node_count=len(section_nodes),
         paragraph_node_count=len(paragraph_nodes),
     )
-
-
-# =============================================================================
-# LEGACY COMPATIBILITY
-# =============================================================================
-
-def build_nodes_legacy(
-    sections_df: pd.DataFrame,
-    elements_df: pd.DataFrame,
-    doc_id: str = "1099div_filer",
-    doc_label: str = "1099-DIV Filer Instructions",
-    role_page_artifact: str = "PageArtifact",
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Legacy-compatible wrapper for build_all_nodes.
-
-    Matches original run_pipeline.py behavior for drop-in replacement.
-
-    Args:
-        sections_df: Sections DataFrame.
-        elements_df: Elements DataFrame.
-        doc_id: Document identifier.
-        doc_label: Label for document root.
-        role_page_artifact: Role to skip (for backwards compatibility).
-
-    Returns:
-        Tuple of (graph_nodes_df, paragraph_nodes_df).
-    """
-    skip_roles = {role_page_artifact}
-
-    result = build_all_nodes(
-        sections_df=sections_df,
-        elements_df=elements_df,
-        doc_id=doc_id,
-        doc_label=doc_label,
-        skip_roles=skip_roles,
-    )
-
-    # Print summary (matching original behavior)
-    print(f"\n--- Building Graph Nodes ---")
-    print(f"  Section nodes: {result.section_node_count}")
-    print(f"  Paragraph nodes: {result.paragraph_node_count}")
-    print(f"  Total nodes: {len(result.nodes_df)}")
-
-    if not result.paragraph_nodes_df.empty and "paragraph_kind" in result.paragraph_nodes_df.columns:
-        print(f"  Paragraphs by kind: {result.paragraph_nodes_df['paragraph_kind'].value_counts().to_dict()}")
-
-    return result.nodes_df, result.paragraph_nodes_df

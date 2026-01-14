@@ -1,0 +1,25 @@
+{
+  "doc_id": "1099div_filer",
+  "schema_version": "semkg_v1",
+  "tables": [
+    "anchors.parquet",
+    "authorities.parquet",
+    "authority_mentions.parquet",
+    "claim_authorities.parquet",
+    "claim_constraints.parquet",
+    "claim_edges.parquet",
+    "claim_precedence.parquet",
+    "claim_rejections.parquet",
+    "claims.parquet",
+    "constraint_attributes.parquet",
+    "constraints.parquet",
+    "element_sentences.parquet",
+    "graph_edges.parquet",
+    "graph_nodes.parquet",
+    "paragraph_authority_edges.parquet",
+    "references.parquet",
+    "sections.parquet",
+    "typed_edge_claims.parquet",
+    "typed_edges.parquet"
+  ]
+}

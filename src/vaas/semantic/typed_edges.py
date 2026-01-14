@@ -213,6 +213,8 @@ TERM_EXCLUDES_PATTERNS = [
     ), 0.90),
 ]
 
+EXCEPT_AS_PROVIDED_RX = re.compile(r"(?i)except\s+as\s+provided\s+below")
+
 # --- EXCLUDED_FROM (Phase 2b) - Box-to-box exclusion with coreference ---
 # Pattern: "Boxes X and Y... Do not include (these amounts) in box Z"
 # Creates: Box Z excluded_from_source [X, Y] (meaning X, Y should not go into Z)
@@ -643,7 +645,7 @@ def extract_applies_if_edges(
                 continue
 
             # Check for negation context (excludes wins)
-            if _has_negation_context(text, match.start()):
+            if _has_negation_context(text, match.start()) and not EXCEPT_AS_PROVIDED_RX.search(text):
                 continue
 
             seen.add(box_key)
@@ -703,7 +705,7 @@ def extract_defines_edges(
             if box_key in seen:
                 continue
 
-            if _has_negation_context(text, match.start()):
+            if _has_negation_context(text, match.start()) and not EXCEPT_AS_PROVIDED_RX.search(text):
                 continue
 
             seen.add(box_key)

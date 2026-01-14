@@ -29,6 +29,7 @@ ANCHOR_TYPE_BOX = "box"
 ANCHOR_TYPE_SECTION = "section"
 ANCHOR_TYPE_SUBSECTION = "subsection"
 ANCHOR_TYPE_PREAMBLE = "preamble"
+ANCHOR_TYPE_REGIME = "regime"  # Scoping container for rules (e.g., "For PFICs...")
 
 
 # =============================================================================
@@ -52,4 +53,5 @@ ANCHOR_TYPE_TO_NODE_TYPE = {
     ANCHOR_TYPE_SECTION: "section",
     ANCHOR_TYPE_SUBSECTION: "concept",
     ANCHOR_TYPE_PREAMBLE: "preamble",
+    ANCHOR_TYPE_REGIME: "regime",  # Scoping container node
 }

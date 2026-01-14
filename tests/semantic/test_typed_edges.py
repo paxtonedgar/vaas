@@ -33,6 +33,56 @@ def test_fallback_edges_are_sentence_scoped():
     assert fallback[0].sentence_char_start == 0
 
 
+def test_defines_term_maps_to_box_key():
+    text = (
+        "Qualified dividends are dividends paid during the tax year from domestic "
+        "corporations and qualified foreign corporations."
+    )
+    edges = extract_concept_to_box_edges(
+        source_node_id="doc:para1",
+        text=text,
+        valid_box_keys={"1b"},
+        form_id="form:1099-div",
+    )
+    defines = [edge for edge in edges if edge.edge_type == "defines"]
+    assert defines
+    assert defines[0].target_box_key == "1b"
+
+
+def test_excludes_term_maps_to_box_key():
+    text = (
+        "Dividends paid by a regulated investment company (RIC) that are not "
+        "treated as qualified dividend income under section 854."
+    )
+    edges = extract_concept_to_box_edges(
+        source_node_id="doc:para1",
+        text=text,
+        valid_box_keys={"1b"},
+        form_id="form:1099-div",
+    )
+    excludes = [edge for edge in edges if edge.edge_type == "excludes"]
+    assert excludes
+    assert excludes[0].target_box_key == "1b"
+
+
+def test_exception_context_emits_excludes():
+    text = (
+        "Dividends the recipient received on any share of stock held for less "
+        "than 61 days during the 121-day period that began 60 days before the "
+        "ex-dividend date."
+    )
+    edges = extract_concept_to_box_edges(
+        source_node_id="doc:para1",
+        text=text,
+        valid_box_keys={"1b"},
+        form_id="form:1099-div",
+        exception_term="qualified dividends",
+    )
+    excludes = [edge for edge in edges if edge.edge_type == "excludes"]
+    assert excludes
+    assert excludes[0].pattern_matched == "exception_context"
+
+
 def test_dedupe_preserves_sentence_variants():
     edges = [
         Edge(
