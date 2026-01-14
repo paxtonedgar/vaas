@@ -19,6 +19,7 @@ import re
 from typing import List, Optional, Tuple, Set
 from dataclasses import dataclass
 
+from vaas.utils.term_bindings import box_key_for_term
 
 @dataclass
 class TypedEdgeCandidate:
@@ -34,6 +35,8 @@ class TypedEdgeCandidate:
     sentence_idx: Optional[int] = None
     sentence_char_start: Optional[int] = None
     sentence_char_end: Optional[int] = None
+    # Rule classification for semantic precedence
+    rule_class: Optional[str] = None  # GATING, PROHIBITION, FALLBACK, POPULATION, AGGREGATION
 
 
 # =============================================================================
@@ -201,6 +204,33 @@ EXCLUDES_PATTERNS = [
     ("not_eligible", re.compile(r"(?i)(?:is|are)\s+not\s+eligible"), 0.85),
 ]
 
+TERM_EXCLUDES_PATTERNS = [
+    ("term_not_qualified", re.compile(
+        r"(?i)\b(?:is|are)\s+not\s+(qualified\s+dividend(?:s|\s+income)?)"
+    ), 0.90),
+    ("term_not_treated", re.compile(
+        r"(?i)not\s+treated\s+as\s+(qualified\s+dividend(?:s|\s+income)?)"
+    ), 0.90),
+]
+
+# --- EXCLUDED_FROM (Phase 2b) - Box-to-box exclusion with coreference ---
+# Pattern: "Boxes X and Y... Do not include (these amounts) in box Z"
+# Creates: Box Z excluded_from_source [X, Y] (meaning X, Y should not go into Z)
+# Uses DOTALL to match across sentences
+EXCLUDED_FROM_PATTERNS = [
+    # "Boxes X and Y... Do not include these amounts in box Z"
+    # Requires "Boxes" (plural) to distinguish from singular box references
+    # Uses \n or sentence boundary to anchor the start
+    ("boxes_coref_exclude", re.compile(
+        r"(?i)(?:^|\n|\.\s+)"  # Start of text, newline, or sentence boundary
+        r"boxes\s+((?:\d+[a-z]?\s*(?:,?\s*(?:and\s+)?)?)+)"  # "Boxes X and Y"
+        r"(?:.*?)"  # intervening text
+        r"do\s+not\s+include\s+(?:these\s+)?(?:amounts?\s+)?in\s+box(?:es)?\s+"
+        r"((?:\d+[a-z]?\s*(?:,?\s*(?:and|or)\s+)?)+)",
+        re.DOTALL
+    ), 0.95),
+]
+
 # --- APPLIES_IF (Phase 2a) - Conditional applicability ---
 # Direction: concept → box
 # NOTE: "see instructions for box X" removed - it's a reference, not a conditional.
@@ -226,6 +256,13 @@ DEFINES_PATTERNS = [
     ("term_refers", re.compile(
         r'(?i)\bthe\s+term\s+"?([A-Za-z][A-Za-z\s\-]{2,40})"?\s+refers\s+to\b'
     ), 0.90),
+    # "Qualified Dividends are dividends paid/received/from..."
+    ("noun_phrase_are_dividends", re.compile(
+        r"(?i)^([A-Z][A-Za-z][A-Za-z\s\-]{2,40})\s+are\s+dividends\s+(?:that|paid|received|from)\b"
+    ), 0.85),
+    ("noun_phrase_are_dividends_anywhere", re.compile(
+        r"(?i)([A-Za-z][A-Za-z\s\-]{2,40})\s+are\s+dividends\s+(?:that|paid|received|from)\b"
+    ), 0.80),
     # "X are dividends that..." - sentence-start anchored
     ("noun_phrase_are", re.compile(
         r"(?i)^([A-Z][A-Za-z][A-Za-z\s\-]{2,40})\s+are\s+dividends\s+that\b"
@@ -254,17 +291,47 @@ REQUIRES_PATTERNS = [
     ("combine_with", re.compile(r"(?i)combine\s+with\s+amounts?\s+in\s+box\s+(\d+[a-z]?)"), 0.85),
 ]
 
-# --- INCLUDES (Phase 2a) - Containment relationship ---
+# --- AGGREGATES (Phase 2b) - Computational containment relationship ---
 # Direction: box → box (e.g., "Box 1a includes amounts in boxes 1b and 2e")
+# Semantic: Box A's value is computed by aggregating Box B's value
+# Excluded from DAG validation (like references_box) - navigational, not structural
+AGGREGATES_PATTERNS = [
+    # "Box 1a includes amounts entered in boxes 1b and 2e" - explicit source box
+    ("aggregates_amounts", re.compile(r"(?i)box\s+(\d+[a-z]?)\s+includes\s+(?:the\s+)?amounts?\s+(?:in|from|entered\s+in|reported\s+in)\s+box(?:es)?\s+((?:\d+[a-z]?(?:,?\s*(?:and\s+)?)?)+)"), 0.95),
+    # "Include all amounts shown in boxes 2b, 2c, 2d, and 2f" - source from section context
+    ("aggregates_include_all", re.compile(r"(?i)include\s+(?:all\s+)?(?:the\s+)?amounts?\s+(?:shown|reported|entered)\s+in\s+box(?:es)?\s+((?:\d+[a-z]?(?:,?\s*(?:and\s+)?)?)+)"), 0.95),
+    # "it also includes...box 6" / "also includes the amount...box 6"
+    # Uses DOTALL to match across newlines in multi-line text
+    ("aggregates_also_includes", re.compile(r"(?i)also\s+includes?\s+.*?box\s+(\d+[a-z]?)", re.DOTALL), 0.90),
+    # "includes amounts in box 1b" (source box inferred from context)
+    ("aggregates_implicit", re.compile(r"(?i)includes?\s+(?:the\s+)?amounts?\s+(?:in|from|entered\s+in|reported\s+in)\s+box(?:es)?\s+((?:\d+[a-z]?(?:,?\s*(?:and\s+)?)?)+)"), 0.90),
+    # "amounts from boxes 1b and 2e are included"
+    ("aggregates_passive", re.compile(r"(?i)amounts?\s+(?:from|in)\s+box(?:es)?\s+((?:\d+[a-z]?(?:,?\s*(?:and\s+)?)?)+)\s+(?:are|is)\s+included"), 0.90),
+    # "this amount includes box 1b"
+    ("aggregates_this", re.compile(r"(?i)this\s+(?:amount|total|figure)\s+includes?\s+(?:the\s+)?(?:amounts?\s+)?(?:in|from)?\s*box(?:es)?\s+((?:\d+[a-z]?(?:,?\s*(?:and\s+)?)?)+)"), 0.85),
+]
+
+# --- SUBSET_OF (Phase 2b) - Child-to-parent subset relationship ---
+# Direction: child_box → parent_box (e.g., "Enter any amount included in box 2a")
+# Semantic: Child box is a breakdown/subset of parent box
+# The parent aggregates the child (inverse relationship)
+SUBSET_OF_PATTERNS = [
+    # "Enter any amount included in box 2a that is..."
+    ("subset_enter_included", re.compile(r"(?i)enter\s+(?:any\s+)?(?:the\s+)?amounts?\s+(?:included|reported|entered|shown)\s+in\s+box\s+(\d+[a-z]?)(?:\s+that\s+(?:is|are))?"), 0.95),
+    # "This amount is included in the amount reported in box 1a"
+    ("subset_included_in", re.compile(r"(?i)this\s+(?:amount|total)\s+is\s+included\s+in\s+(?:the\s+)?(?:amount\s+)?(?:reported\s+in\s+)?box\s+(\d+[a-z]?)"), 0.95),
+    # "amount included in box X"
+    ("subset_amount_in", re.compile(r"(?i)(?:the\s+)?amount\s+(?:is\s+)?included\s+in\s+box\s+(\d+[a-z]?)"), 0.90),
+]
+
+# --- INCLUDES (Phase 2a) - Conceptual containment relationship ---
+# Direction: box → box (non-computational containment, co-reporting)
+# Kept separate from aggregates for semantic distinction
 INCLUDES_PATTERNS = [
-    # "Box 1a includes amounts entered in boxes 1b and 2e"
-    ("includes_amounts", re.compile(r"(?i)box\s+(\d+[a-z]?)\s+includes\s+(?:the\s+)?amounts?\s+(?:in|from|entered\s+in|reported\s+in)\s+box(?:es)?\s+((?:\d+[a-z]?(?:,?\s*(?:and\s+)?)?)+)"), 0.95),
-    # "includes amounts in box 1b" (without explicit source box)
-    ("includes_box", re.compile(r"(?i)includes?\s+(?:the\s+)?(?:amounts?\s+)?(?:in|from|entered\s+in)\s+box(?:es)?\s+((?:\d+[a-z]?(?:,?\s*(?:and\s+)?)?)+)"), 0.90),
-    # "reported in both box 1a and 1b"
+    # "reported in both box 1a and 1b" - co-reporting relationship
     ("reported_in_both", re.compile(r"(?i)reported\s+in\s+both\s+box(?:es)?\s+(\d+[a-z]?)\s+and\s+(\d+[a-z]?)"), 0.85),
-    # "also includes" pattern for secondary inclusions
-    ("also_includes", re.compile(r"(?i)also\s+includes?\s+(?:the\s+)?(?:amounts?\s+)?(?:in|from|entered\s+in)?\s*box(?:es)?\s+((?:\d+[a-z]?(?:,?\s*(?:and\s+)?)?)+)"), 0.85),
+    # "also includes" pattern for secondary inclusions (not amounts-based)
+    ("also_includes", re.compile(r"(?i)also\s+includes?\s+(?:the\s+)?(?:in|from|entered\s+in)?\s*box(?:es)?\s+((?:\d+[a-z]?(?:,?\s*(?:and\s+)?)?)+)"), 0.85),
 ]
 
 # --- PORTION_OF (Phase 2a) - Subset relationship ---
@@ -295,6 +362,57 @@ PORTION_OF_PATTERNS = [
     ("box_attributable", re.compile(
         r"(?i)(?:reported|entered|shown)\s+in\s+box\s+(\d+[a-z]?)\s+"
         r"(?:is|are)\s+attributable\s+to"
+    ), 0.90),
+]
+
+# --- GATING (Rule class: GATING) - Who/when a box may be completed ---
+# Direction: concept → box (gating constraint on box completion)
+# These have highest semantic precedence - they determine WHO can use the box
+GATING_PATTERNS = [
+    # "Only RICs and REITs should complete boxes 2e and 2f"
+    ("gating_only_should", re.compile(
+        r"(?i)only\s+([A-Za-z\s]+?)\s+should\s+complete\s+box(?:es)?\s+"
+        r"((?:\d+[a-z]?\s*(?:,?\s*(?:and|or)\s*)?)+)"
+    ), 0.95),
+    # "Boxes X and Y apply only to [entity type]"
+    ("gating_apply_only", re.compile(
+        r"(?i)box(?:es)?\s+((?:\d+[a-z]?\s*(?:,?\s*(?:and|or)\s*)?)+)\s+"
+        r"appl(?:y|ies)\s+only\s+to\s+([A-Za-z\s]+)"
+    ), 0.90),
+    # "Do not complete box X unless [condition]"
+    ("gating_unless", re.compile(
+        r"(?i)do\s+not\s+complete\s+box(?:es)?\s+"
+        r"((?:\d+[a-z]?\s*(?:,?\s*(?:and|or)\s*)?)+)\s+unless\b"
+    ), 0.90),
+    # "Complete box X only if [condition]"
+    ("gating_only_if", re.compile(
+        r"(?i)complete\s+box(?:es)?\s+"
+        r"((?:\d+[a-z]?\s*(?:,?\s*(?:and|or)\s*)?)+)\s+only\s+if\b"
+    ), 0.90),
+]
+
+# --- FALLBACK (Rule class: FALLBACK) - Exception/default rules ---
+# Direction: concept → box (fallback behavior when normal rules can't apply)
+# These override normal eligibility/disqualification rules
+FALLBACK_PATTERNS = [
+    # "Include dividends for which it is impractical to determine if..."
+    ("fallback_impractical", re.compile(
+        r"(?i)(?:include|report|enter)\s+(?:.*?)\s+for\s+which\s+it\s+is\s+"
+        r"impractical\s+(?:to\s+determine|for\s+the\s+[A-Za-z]+\s+to\s+determine)"
+    ), 0.95),
+    # "If you are unable to determine ... by the time you must file"
+    ("fallback_unable", re.compile(
+        r"(?i)if\s+you\s+(?:are\s+)?unable\s+to\s+determine\s+.*?"
+        r"(?:by\s+the\s+time|before)\s+(?:you\s+must\s+)?file"
+    ), 0.90),
+    # "report the entire amount as [default]"
+    ("fallback_entire", re.compile(
+        r"(?i)report\s+(?:the\s+)?entire\s+(?:amount|distribution)\s+as\b"
+    ), 0.85),
+    # "Include even if [condition not met]"
+    ("fallback_even_if", re.compile(
+        r"(?i)include\s+(?:.*?)\s+even\s+if\s+(?:the\s+)?"
+        r"(?:holding\s+period|requirement|condition)"
     ), 0.90),
 ]
 
@@ -345,6 +463,7 @@ def extract_excludes_edges(
     anchor_id: str,
     text: str,
     valid_box_keys: Set[str],
+    form_id: Optional[str] = None,
 ) -> List[TypedEdgeCandidate]:
     """
     Extract excludes edges from text.
@@ -383,6 +502,9 @@ def extract_excludes_edges(
                 continue
             if box_key in seen:
                 continue
+            # Skip self-loops: don't create edge from box_X to box_X
+            if anchor_id == f"box_{box_key}" or anchor_id.endswith(f"_{box_key}"):
+                continue
             seen.add(box_key)
 
             evidence = _clean_evidence(text, ref_pos, len(match.group(0)))
@@ -395,9 +517,102 @@ def extract_excludes_edges(
                 evidence_text=evidence,
                 pattern_matched=pattern_name,
                 polarity="negative",
+                rule_class="PROHIBITION",
             ))
 
+    if form_id:
+        for pattern_name, pattern, confidence in TERM_EXCLUDES_PATTERNS:
+            for match in pattern.finditer(text):
+                term = match.group(1)
+                box_key = box_key_for_term(term, form_id)
+                if not box_key:
+                    continue
+                if box_key not in valid_box_keys:
+                    continue
+                if box_key in seen:
+                    continue
+                seen.add(box_key)
+                evidence = _clean_evidence(text, match.start(), len(match.group(0)))
+                edges.append(TypedEdgeCandidate(
+                    edge_type="excludes",
+                    source_anchor_id=anchor_id,
+                    target_box_key=box_key,
+                    confidence=confidence,
+                    evidence_text=evidence,
+                    pattern_matched=pattern_name,
+                    polarity="negative",
+                    rule_class="PROHIBITION",
+                ))
+
     return edges
+
+
+def _context_excludes_edges(
+    anchor_id: str,
+    text: str,
+    valid_box_keys: Set[str],
+    form_id: Optional[str],
+    exception_term: Optional[str],
+) -> List[TypedEdgeCandidate]:
+    if not form_id or not exception_term:
+        return []
+    box_key = box_key_for_term(exception_term, form_id)
+    if not box_key or box_key not in valid_box_keys:
+        return []
+    evidence = " ".join(text.split())
+    return [
+        TypedEdgeCandidate(
+            edge_type="excludes",
+            source_anchor_id=anchor_id,
+            target_box_key=box_key,
+            confidence=0.80,
+            evidence_text=evidence,
+            pattern_matched="exception_context",
+            polarity="negative",
+            rule_class="PROHIBITION",
+        )
+    ]
+
+
+def extract_excluded_from_edges(
+    text: str,
+    valid_box_keys: Set[str],
+) -> List[Tuple[str, str, float, str]]:
+    """
+    Extract box-to-box exclusion relationships using coreference patterns.
+
+    Pattern: "Boxes X and Y... Do not include these amounts in box Z"
+    Returns: List of (excluded_box, target_box, confidence, evidence) tuples
+
+    This captures which boxes should NOT be included in which other boxes.
+    """
+    if not text:
+        return []
+
+    results = []
+
+    for pattern_name, pattern, confidence in EXCLUDED_FROM_PATTERNS:
+        for match in pattern.finditer(text):
+            # Group 1: excluded boxes (X, Y)
+            # Group 2: target boxes (Z) that should NOT include X, Y
+            excluded_ref = match.group(1)
+            target_ref = match.group(2)
+
+            excluded_boxes = _extract_box_keys(excluded_ref)
+            target_boxes = _extract_box_keys(target_ref)
+
+            evidence = _clean_evidence(text, match.start(), min(len(match.group(0)), 150))
+
+            for excl in excluded_boxes:
+                if excl not in valid_box_keys:
+                    continue
+                for tgt in target_boxes:
+                    if tgt not in valid_box_keys:
+                        continue
+                    if excl != tgt:  # No self-exclusions
+                        results.append((excl, tgt, confidence, evidence))
+
+    return results
 
 
 def extract_applies_if_edges(
@@ -442,6 +657,7 @@ def extract_applies_if_edges(
                 evidence_text=evidence,
                 pattern_matched=pattern_name,
                 polarity="positive",
+                rule_class="POPULATION",
             ))
 
     return edges
@@ -452,13 +668,14 @@ def extract_defines_edges(
     text: str,
     valid_box_keys: Set[str],
     excluded_boxes: Set[str],
+    form_id: Optional[str] = None,
 ) -> List[TypedEdgeCandidate]:
     """
     Extract defines edges from text.
     Direction: concept → box
 
-    Note: Some patterns capture terms, not boxes. Those need box resolution
-    via nearby references. For now, only emit when box is directly captured.
+    Note: Some patterns capture terms, not boxes. These resolve via term bindings
+    when form_id is available.
     """
     if not text:
         return []
@@ -475,9 +692,9 @@ def extract_defines_edges(
                 # Direct box reference
                 box_key = captured.lower()
             else:
-                # Term captured - need to find nearby box reference
-                # For now, skip (Phase 2b can add term→box resolution)
-                continue
+                box_key = box_key_for_term(captured, form_id)
+                if not box_key:
+                    continue
 
             if box_key not in valid_box_keys:
                 continue
@@ -500,6 +717,7 @@ def extract_defines_edges(
                 evidence_text=evidence,
                 pattern_matched=pattern_name,
                 polarity="positive",
+                rule_class="POPULATION",
             ))
 
     return edges
@@ -546,6 +764,7 @@ def extract_qualifies_edges(
                 evidence_text=evidence,
                 pattern_matched=pattern_name,
                 polarity="positive",
+                rule_class="POPULATION",
             ))
 
     return edges
@@ -599,7 +818,133 @@ def extract_requires_edges(
                     evidence_text=evidence,
                     pattern_matched=pattern_name,
                     polarity="positive",
+                    rule_class="AGGREGATION",
                 ))
+
+    return edges
+
+
+def extract_aggregates_edges(
+    anchor_id: str,
+    source_box_key: Optional[str],
+    text: str,
+    valid_box_keys: Set[str],
+    excluded_boxes: Set[str],
+) -> List[TypedEdgeCandidate]:
+    """
+    Extract aggregates edges from text.
+    Direction: box → box (e.g., "Box 1a includes amounts in boxes 1b and 2e")
+
+    Semantic: Box A's value is computed by aggregating Box B's value.
+    This is distinct from 'includes' which is conceptual containment.
+
+    Only emits edges when source is a box anchor.
+    """
+    if not text or not source_box_key:
+        return []
+
+    edges = []
+    seen = set()
+
+    for pattern_name, pattern, confidence in AGGREGATES_PATTERNS:
+        for match in pattern.finditer(text):
+            # Handle different capture group structures
+            if pattern_name == "aggregates_amounts":
+                # Group 1 is source box, group 2 is target boxes
+                src_box = match.group(1).lower()
+                if src_box != source_box_key:
+                    continue  # Only emit if matches current box
+                ref_text = match.group(2)
+            else:
+                # Other patterns: group 1 is target boxes
+                ref_text = match.group(1)
+
+            target_keys = _extract_box_keys(ref_text)
+
+            for box_key in target_keys:
+                if box_key not in valid_box_keys:
+                    continue
+                if box_key in excluded_boxes:
+                    continue
+                if box_key == source_box_key:
+                    continue  # No self-edges
+                if box_key in seen:
+                    continue
+
+                if _has_negation_context(text, match.start()):
+                    continue
+
+                seen.add(box_key)
+                evidence = _clean_evidence(text, match.start(), len(match.group(0)))
+
+                edges.append(TypedEdgeCandidate(
+                    edge_type="aggregates",
+                    source_anchor_id=anchor_id,
+                    target_box_key=box_key,
+                    confidence=confidence,
+                    evidence_text=evidence,
+                    pattern_matched=pattern_name,
+                    polarity="positive",
+                    rule_class="AGGREGATION",
+                ))
+
+    return edges
+
+
+def extract_subset_of_edges(
+    anchor_id: str,
+    source_box_key: Optional[str],
+    text: str,
+    valid_box_keys: Set[str],
+    excluded_boxes: Set[str],
+) -> List[TypedEdgeCandidate]:
+    """
+    Extract subset_of edges from text.
+    Direction: child_box → parent_box (e.g., "Enter any amount included in box 2a")
+
+    Semantic: Source box (child) is a subset/breakdown of target box (parent).
+    For example, Box 2b's instruction "Enter any amount included in box 2a"
+    means Box 2b is a subset of Box 2a.
+
+    This is the inverse of aggregates - parent aggregates child.
+    Only emits edges when source is a box anchor.
+    """
+    if not text or not source_box_key:
+        return []
+
+    edges = []
+    seen = set()
+
+    for pattern_name, pattern, confidence in SUBSET_OF_PATTERNS:
+        for match in pattern.finditer(text):
+            # Target is the parent box mentioned in the pattern
+            target_box_key = match.group(1).lower()
+
+            if target_box_key not in valid_box_keys:
+                continue
+            if target_box_key in excluded_boxes:
+                continue
+            if target_box_key == source_box_key:
+                continue  # No self-edges
+            if target_box_key in seen:
+                continue
+
+            if _has_negation_context(text, match.start()):
+                continue
+
+            seen.add(target_box_key)
+            evidence = _clean_evidence(text, match.start(), len(match.group(0)))
+
+            edges.append(TypedEdgeCandidate(
+                edge_type="subset_of",
+                source_anchor_id=anchor_id,
+                target_box_key=target_box_key,
+                confidence=confidence,
+                evidence_text=evidence,
+                pattern_matched=pattern_name,
+                polarity="positive",
+                rule_class="AGGREGATION",
+            ))
 
     return edges
 
@@ -613,8 +958,9 @@ def extract_includes_edges(
 ) -> List[TypedEdgeCandidate]:
     """
     Extract includes edges from text.
-    Direction: box → box (e.g., "Box 1a includes amounts in boxes 1b and 2e")
+    Direction: box → box (conceptual containment, co-reporting)
 
+    This is distinct from 'aggregates' which is computational containment.
     Only emits edges when source is a box anchor.
     """
     if not text or not source_box_key:
@@ -625,14 +971,8 @@ def extract_includes_edges(
 
     for pattern_name, pattern, confidence in INCLUDES_PATTERNS:
         for match in pattern.finditer(text):
-            # Different patterns capture differently
-            if pattern_name == "includes_amounts":
-                # Group 1 is source box, group 2 is target boxes
-                src_box = match.group(1).lower()
-                if src_box != source_box_key:
-                    continue  # Only emit if matches current box
-                ref_text = match.group(2)
-            elif pattern_name == "reported_in_both":
+            # Handle different capture group structures
+            if pattern_name == "reported_in_both":
                 # Both groups are boxes in a relationship
                 ref_text = f"{match.group(1)}, {match.group(2)}"
             else:
@@ -664,6 +1004,7 @@ def extract_includes_edges(
                     evidence_text=evidence,
                     pattern_matched=pattern_name,
                     polarity="positive",
+                    rule_class="AGGREGATION",
                 ))
 
     return edges
@@ -728,7 +1069,133 @@ def extract_portion_of_edges(
                 evidence_text=evidence,
                 pattern_matched=pattern_name,
                 polarity="positive",
+                rule_class="POPULATION",
             ))
+
+    return edges
+
+
+def extract_gating_edges(
+    anchor_id: str,
+    text: str,
+    valid_box_keys: Set[str],
+) -> List[TypedEdgeCandidate]:
+    """
+    Extract gating edges from text.
+    Direction: concept → box
+
+    Captures gating constraints that determine WHO can complete a box:
+    - "Only RICs and REITs should complete boxes 2e and 2f"
+    - "Boxes X and Y apply only to [entity type]"
+    - "Do not complete box X unless [condition]"
+
+    Rule class: GATING (highest semantic precedence)
+    """
+    if not text or not text.strip():
+        return []
+
+    edges: List[TypedEdgeCandidate] = []
+    seen: Set[str] = set()
+
+    for pattern_name, pattern, confidence in GATING_PATTERNS:
+        for match in pattern.finditer(text):
+            # Different patterns have different capture group structures
+            if pattern_name == "gating_only_should":
+                # Group 1 is entity type, Group 2 is box list
+                box_ref = match.group(2)
+            elif pattern_name == "gating_apply_only":
+                # Group 1 is box list, Group 2 is entity type
+                box_ref = match.group(1)
+            else:
+                # Other patterns: Group 1 is box list
+                box_ref = match.group(1)
+
+            box_keys = _extract_box_keys(box_ref)
+
+            for box_key in box_keys:
+                if box_key not in valid_box_keys:
+                    continue
+                if box_key in seen:
+                    continue
+
+                seen.add(box_key)
+                evidence = _clean_evidence(text, match.start(), len(match.group(0)))
+
+                edges.append(TypedEdgeCandidate(
+                    edge_type="gated_by",
+                    source_anchor_id=anchor_id,
+                    target_box_key=box_key,
+                    confidence=confidence,
+                    evidence_text=evidence,
+                    pattern_matched=pattern_name,
+                    polarity="positive",
+                    rule_class="GATING",
+                ))
+
+    return edges
+
+
+def extract_fallback_edges(
+    anchor_id: str,
+    text: str,
+    valid_box_keys: Set[str],
+) -> List[TypedEdgeCandidate]:
+    """
+    Extract fallback/exception edges from text.
+    Direction: concept → box
+
+    Captures fallback rules that apply when normal rules can't:
+    - "Include dividends for which it is impractical to determine..."
+    - "If you are unable to determine... by the time you must file"
+    - "report the entire amount as [default]"
+
+    Rule class: FALLBACK (overrides normal eligibility rules)
+    """
+    if not text or not text.strip():
+        return []
+
+    edges: List[TypedEdgeCandidate] = []
+    seen: Set[str] = set()
+
+    # Find box references in the text
+    box_matches = list(BOX_REF_PATTERN.finditer(text))
+
+    for pattern_name, pattern, confidence in FALLBACK_PATTERNS:
+        for match in pattern.finditer(text):
+            # Fallback patterns don't capture box keys directly
+            # We need to find nearby box references
+            match_start = match.start()
+            match_end = match.end()
+
+            # Look for box references within or after the pattern match
+            for box_match in box_matches:
+                # Accept box references that appear after the fallback trigger
+                # or within 100 chars of it
+                if box_match.start() < match_start - 100:
+                    continue
+
+                box_ref = box_match.group(1)
+                box_keys = _extract_box_keys(box_ref)
+
+                for box_key in box_keys:
+                    if box_key not in valid_box_keys:
+                        continue
+                    if box_key in seen:
+                        continue
+
+                    seen.add(box_key)
+                    evidence = _clean_evidence(text, match.start(), len(match.group(0)))
+
+                    edges.append(TypedEdgeCandidate(
+                        edge_type="fallback_include",
+                        source_anchor_id=anchor_id,
+                        target_box_key=box_key,
+                        confidence=confidence,
+                        evidence_text=evidence,
+                        pattern_matched=pattern_name,
+                        polarity="positive",
+                        rule_class="FALLBACK",
+                    ))
 
     return edges
 
@@ -858,6 +1325,8 @@ def extract_concept_to_box_edges(
     text: str,
     valid_box_keys: Set[str],
     parent_box_key: Optional[str] = None,
+    form_id: Optional[str] = None,
+    exception_term: Optional[str] = None,
 ) -> List[TypedEdgeCandidate]:
     """
     Extract concept→box semantic edges from text (paragraph or concept section).
@@ -865,10 +1334,11 @@ def extract_concept_to_box_edges(
     This is the Phase B "correct" extraction: the source is the rule-holder
     (paragraph node), not the parent anchor.
 
-    Extracts: excludes, applies_if, portion_of, defines, qualifies
-    Does NOT extract: requires, includes (those are box→box)
+    Extracts: gated_by, excludes, fallback_include, applies_if, portion_of, defines, qualifies
+    Does NOT extract: requires, includes, aggregates, subset_of (those are box→box)
 
     Sentence gating is applied for precision.
+    Rule class determines semantic precedence (GATING > PROHIBITION > FALLBACK > POPULATION).
 
     Args:
         source_node_id: Full node ID of the source (e.g., "doc_id:el_123").
@@ -889,11 +1359,40 @@ def extract_concept_to_box_edges(
     sents = split_sentences_with_offsets(text)
 
     # -------------------------------------------------------------------------
-    # PASS 1: EXCLUDES (global precedence) across all sentences
+    # PASS 0: GATING (highest semantic precedence) - sentence-level
+    # "Only RICs and REITs should complete boxes 2e and 2f"
+    # -------------------------------------------------------------------------
+    gating_edges: List[TypedEdgeCandidate] = []
+    for i, (sent, s, e) in enumerate(sents):
+        g = extract_gating_edges(source_node_id, sent, valid_box_keys)
+        gating_edges.extend(_attach_sentence_provenance(g, i, s, e))
+    all_edges.extend(gating_edges)
+
+    # -------------------------------------------------------------------------
+    # PASS 1: PROHIBITION (excludes) across all sentences
     # -------------------------------------------------------------------------
     excludes_edges: List[TypedEdgeCandidate] = []
     for i, (sent, s, e) in enumerate(sents):
-        edges_i = extract_excludes_edges(source_node_id, sent, valid_box_keys)
+        edges_i = extract_excludes_edges(
+            source_node_id,
+            sent,
+            valid_box_keys,
+            form_id=form_id,
+        )
+        if exception_term:
+            existing = {edge.target_box_key for edge in edges_i}
+            context_edges = _context_excludes_edges(
+                source_node_id,
+                sent,
+                valid_box_keys,
+                form_id,
+                exception_term,
+            )
+            context_edges = [
+                edge for edge in context_edges
+                if edge.target_box_key not in existing
+            ]
+            edges_i.extend(context_edges)
         edges_i = _attach_sentence_provenance(edges_i, i, s, e)
         excludes_edges.extend(edges_i)
 
@@ -901,7 +1400,17 @@ def extract_concept_to_box_edges(
     excluded_boxes = {ed.target_box_key for ed in excludes_edges}
 
     # -------------------------------------------------------------------------
-    # PASS 2: Other concept→box semantic edges (sentence-gated)
+    # PASS 1.5: FALLBACK (exception rules) - sentence-level
+    # "Include dividends for which it is impractical to determine..."
+    # -------------------------------------------------------------------------
+    fallback_edges: List[TypedEdgeCandidate] = []
+    for i, (sent, s, e) in enumerate(sents):
+        f = extract_fallback_edges(source_node_id, sent, valid_box_keys)
+        fallback_edges.extend(_attach_sentence_provenance(f, i, s, e))
+    all_edges.extend(fallback_edges)
+
+    # -------------------------------------------------------------------------
+    # PASS 2: POPULATION edges (sentence-gated)
     # -------------------------------------------------------------------------
     applies_if_edges: List[TypedEdgeCandidate] = []
     portion_of_edges: List[TypedEdgeCandidate] = []
@@ -922,7 +1431,13 @@ def extract_concept_to_box_edges(
     excluded_from_defines = excluded_boxes | portion_of_boxes
 
     for i, (sent, s, e) in enumerate(sents):
-        d = extract_defines_edges(source_node_id, sent, valid_box_keys, excluded_from_defines)
+        d = extract_defines_edges(
+            source_node_id,
+            sent,
+            valid_box_keys,
+            excluded_from_defines,
+            form_id=form_id,
+        )
         defines_edges.extend(_attach_sentence_provenance(d, i, s, e))
 
         q = extract_qualifies_edges(source_node_id, sent, valid_box_keys, excluded_boxes)
@@ -949,8 +1464,8 @@ def extract_box_to_box_edges(
     """
     Extract box→box dependency edges from text (box section).
 
-    Extracts: requires, includes
-    These describe relationships between boxes, not rules.
+    Extracts: aggregates, subset_of, requires, includes, fallback_include
+    These describe relationships between boxes and fallback rules within box instructions.
 
     Args:
         source_node_id: Full node ID of the source box (e.g., "doc_id:box_1a")
@@ -970,6 +1485,31 @@ def extract_box_to_box_edges(
     # (they expect anchor_id like "box_1a", not full node_id)
     anchor_id = source_node_id.split(":")[-1] if ":" in source_node_id else source_node_id
 
+    # Extract fallback edges (exception rules like "impractical to determine")
+    # These have FALLBACK precedence - override normal qualification rules
+    fallback = extract_fallback_edges(anchor_id, text, valid_box_keys)
+    all_edges.extend(fallback)
+
+    # Extract aggregates edges (parent aggregates child)
+    aggregates = extract_aggregates_edges(
+        anchor_id=anchor_id,
+        source_box_key=source_box_key,
+        text=text,
+        valid_box_keys=valid_box_keys,
+        excluded_boxes=set(),
+    )
+    all_edges.extend(aggregates)
+
+    # Extract subset_of edges (child is subset of parent)
+    subset_of = extract_subset_of_edges(
+        anchor_id=anchor_id,
+        source_box_key=source_box_key,
+        text=text,
+        valid_box_keys=valid_box_keys,
+        excluded_boxes=set(),
+    )
+    all_edges.extend(subset_of)
+
     # Extract requires edges
     requires = extract_requires_edges(
         anchor_id=anchor_id,
@@ -980,7 +1520,7 @@ def extract_box_to_box_edges(
     )
     all_edges.extend(requires)
 
-    # Extract includes edges
+    # Extract includes edges (conceptual containment)
     includes = extract_includes_edges(
         anchor_id=anchor_id,
         source_box_key=source_box_key,
